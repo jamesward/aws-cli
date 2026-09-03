@@ -192,7 +192,7 @@ traverse? ──▶ source ──▶ transform* ──▶ fold? ──▶ bind
 - **source** — the one effectful operator (an API call) or a pure one (a correlation of two bound values, or
   a plain reference). A call yields a *stream* of records; pagination is a bound on that stream rather than a
   separate concept, so every downstream operator behaves identically whether the call paginated or not.
-- **transform** — optional: filter, deduplicate, chunk. Applied *before retention*, together with the
+- **transform** — optional: correlate, filter, deduplicate. Applied *before retention*, together with the
   automatically derived field pruning, so a binding can pull four fields out of a 40 MB page and never hold the
   page. Which fields those are is not authored; it is inferred from what consumers use (§11.2).
 - **fold** — optional aggregation into a single value. Because aggregation is expressed as a monoid with
@@ -212,7 +212,7 @@ A plan is a **DAG, not a script.** `let` is an unordered set that happens to be 
 execution order is derived, and two steps with no path between them may run at the same time.
 
 **Edges are derived, not declared.** An edge `a → b` exists when any expression in `b` references
-another binding's value. Every position participates: `args`, `region`, `forEach.in`, `lookup.in`, stage keys,
+another binding's value. Every position participates: `args`, `region`, `forEach.in`, `attach.in`, stage keys,
 `result`, and `expect`. Nothing else creates an edge — in particular, adjacency in `let` does not, and there is
 no construct for declaring an edge without data behind it (§4.2.3).
 
@@ -594,9 +594,9 @@ There is one structural concept. A **block** is either an expression or a `let`-
 ```jsonc
 Plan     = { codemode, description, inputs? } & Block
 
-Block    = { forEach?,                              // { in, as, batch? } — traverse (§9.1.2)
+Block    = { forEach?,                              // { in, as, batch?, do } — traverse (§9.1.2)
              let?,                                  // local bindings
-             source?, filter?, dedup?, chunk?, fold?,   // an expression, if present (§10.1)
+             source?, attach?, filter?, dedup?, fold?,   // an expression, if present (§10.1)
              result?,                               // the block's value (§10.4)
              expect?, onError? }
 
@@ -608,12 +608,28 @@ expect   : Map[Label, Predicate]      // named assertions (§9.7)
 bindings and a body; an earlier draft forced a choice between them, which is why nesting needed a special
 source kind and why three rules existed to police the combinations.
 
-`forEach` is a small record — the collection, the name to bind it to, and an optional batch size — because
-those three are meaningless apart. That is the counterpart to flattening the stage keys out of a `pipeline`
-wrapper (§9.1.1): **flatten when keys are independently meaningful, group when they only make sense
-together.** A stage key is meaningful whenever a block has a source; `as` and `batch` mean nothing without
-something to traverse, and a `forEach` without an `as` would be a state to check rather than one that cannot
-be written.
+`forEach` is a record with four parts — the collection, the name to bind each element to, an optional batch
+size, and **`do`, the block to evaluate per element**. It carries its body explicitly because it is a
+higher-order operator: §10.1 types it as `Ref → (Item → One[T]) → Stream[{item, T}]`, and `do` is that
+function. An earlier draft left the body implicit — a block containing `forEach` meant "evaluate *this* block
+per element" — which made one key silently change the level of all its siblings.
+
+That grouping is the counterpart to flattening the stage keys out of a `pipeline` wrapper (§9.1.1):
+**flatten when keys are independently meaningful, group when they only make sense together.** A stage key is
+meaningful whenever a block has a source; `as`, `batch`, and `do` mean nothing without something to traverse.
+
+Making the body explicit distinguishes two levels that were previously conflated:
+
+| Key                         | Level                                                                         |
+|-----------------------------|-------------------------------------------------------------------------------|
+| everything inside `do`      | per element                                                                   |
+| `result` on the outer block | over the whole `{item, value}` list                                           |
+| `expect` on the outer block | over the fan-out outcome — `count`, `errors`, `truncated` are aggregate facts |
+| `onError`                   | how an element's failure is handled by the traversal                          |
+| `let` on the outer block    | evaluated **once**, visible to every element                                  |
+| `let` inside `do`           | evaluated **per element**                                                     |
+
+The last pair is a capability the implicit form could not express at all.
 
 A block is a **flat record of optional keys**. There is no `pipeline` wrapper: once the stages are named keys
 in a canonical order, a container whose only job is grouping them carries no information. The same flattening
@@ -627,14 +643,39 @@ is an error, because the answer is genuinely a combination and guessing would be
 **Scope inside a block** is the enclosing scope, plus the block's own `let` names, plus — if `source` is
 present — the records flowing through the stages.
 
-Four rules, and that is the whole combination story:
+**Not every combination of those keys is meaningful.** A flat record of ten optional keys admits 2¹⁰ shapes, of
+which roughly a quarter are legal — so the validity structure is worth stating as structure rather than as a
+list of prohibitions. A block plays exactly **one of three roles**, decided by which value-provider it has:
 
-1. **Stage keys require `source`.** `filter`, `dedup`, `chunk`, and `fold` transform a stream, and without a
-   source there is no stream: *"`filter` requires `source`; there is no stream to filter"*.
-2. **A block needs at least one of `source`, `let`, or `result`**, or it has no value.
-3. **Names are unique along the scope chain.** Shadowing is rejected, so a name means one thing in a plan.
-4. **Duplicate keys are rejected** in `let`, `expect`, `inputs`, and `args` alike. JSON parsers disagree about
-   duplicates and Python's silently keeps the last, so parsing uses a hook that reports them.
+| Key                                 | Traverse (`forEach`)      | Express (`source`) | Assemble (neither)               |
+|-------------------------------------|---------------------------|--------------------|----------------------------------|
+| `forEach`                           | required                  | —                  | —                                |
+| `source`                            | —                         | required           | —                                |
+| `attach`, `filter`, `dedup`, `fold` | — they belong inside `do` | yes, independently | —                                |
+| `let`                               | yes                       | yes                | yes                              |
+| `result`                            | shapes the envelope list  | shapes the stream  | yes; defaults to the unique sink |
+| `expect`                            | yes                       | yes                | yes                              |
+| `onError`                           | yes, per element          | yes                | — makes no calls of its own      |
+
+Reading the table as rules: stage keys require `source`, because they transform a stream and without a source
+there is none. `forEach` and `source` are mutually exclusive, because a traversing block takes its value from
+`forEach.do` and each element's source belongs inside it. `onError` requires one of the two, because an Assemble
+block has no failures of its own to police — its bindings each carry their own policy. And the three roles are
+exhaustive, which is the same statement as "a block needs at least one of `source`, `let`, or `result`".
+
+Two rules are about names rather than shape:
+
+- **Names are unique along the scope chain.** Bindings and traversal variables share one namespace (§9.2), so
+  shadowing is rejected and a name means one thing in a plan.
+- **Duplicate keys are rejected** in `let`, `expect`, `inputs`, and `args` alike. JSON parsers disagree about
+  duplicates and Python's silently keeps the last, so parsing uses a hook that reports them.
+
+**The roles are a union, and it needs no tag.** Presence of `forEach` versus `source` versus neither
+discriminates the branches, so the generated JSON Schema is a `oneOf` over three branches while the document
+stays exactly as flat as it looks here — nothing on the wire changes, and invalid combinations become
+unrepresentable rather than diagnosed (§17.1). This also sharpens the criterion above: *within* the Express
+branch the four stage keys really are independently meaningful, so flat is right for them. What needed structure
+was never the stages but the branch discrimination, which an earlier draft wrote as prose.
 
 There is no projection *stage*. Which fields to **carry** is derived from what consumers use (§11.2); which
 fields to **name and expose** is `result`. The first is a dataflow fact, the second is authorial intent, and an
@@ -649,7 +690,7 @@ document depends on position**:
 |---------------------------------------------------|------------------|-----------------------------------------------------------------------|
 | `let`, `expect`, `inputs`, `args`, `fold` product | map              | items have natural unique names                                       |
 | stage keys on a block                             | named keys       | composition order is canonical (§10.1), not authored                  |
-| `forEach`                                         | record           | `in`/`as`/`batch` are meaningless apart, so they are grouped          |
+| `forEach`                                         | record           | `in`/`as`/`batch`/`do` are meaningless apart, so they are grouped     |
 | `filter`                                          | single predicate | conjunction is explicit (`and`), never implied by a container (§10.3) |
 | `and` / `or` operands                             | array            | the argument list of a commutative operator; the normalizer sorts it  |
 | `result` (map form)                               | map              | output names are names                                                |
@@ -661,51 +702,142 @@ canonically, which makes review, diffing, and `explain` output stable, and remov
 reformatting a document could change what it does. Mutating bindings, which in an earlier draft took their
 ordering from declaration position, now run in a phase after all reads (§4.2.1) — derived, not authored.
 
-#### 9.1.2 The block in full
+#### 9.1.2 The block in full, by role
+
+Shared parts first, then exactly one of three roles. The document is flat — the role headings are the schema's
+`oneOf` branches (§17.1), not nesting.
 
 ```jsonc
-{ "forEach": { "in": <ref>, "as": "<name>", "batch": <int>? }?,   // evaluate the block per element
+Plan  = { "codemode": "v1", "description": <string>, "inputs": Inputs?, …Block }
 
-  "let":     { "<name>": Block, … }?,             // local bindings; nesting is just this (§9.2.1)
+Block = { "let":    { <name>: Block, … }?,        // shared — local bindings, evaluated once
+          "expect": { <label>: Predicate, … }?,   // shared — assertions on the outcome (§9.7)
+          …Role }                                 // exactly one of the three below
 
-  "source":  { "call": { "service": …, "operation": …, "args": { … },
-                         "region": <ref|literal>?, "paginate": { … }? } }
-           | <ref>,
-  "lookup":  { "in": <ref>, "on": "<path>",       // stages; each at most once, canonical order
-               "match": "<path>"?, "as": "<name>" }?,
-  "filter":  <predicate>?,
-  "dedup":   [ <path>, … ]?,                      // [] = the derived field set (§11.2)
-  "chunk":   <int>?,
-  "fold":    <aggregator>?,
 
-  "result":  <projection>?,                       // the block's value
-  "expect":  { "<label>": <predicate>, … }?,
-  "onError": "fail" | "skip" | "collect" }
+// ── Role 1 · Traverse ── evaluate a block once per element ────────────────────────────────
+{ "forEach": { "in": Ref, "as": <name>, "batch": <int>?, "do": Block },
+  "result":  Projection?,      // over the envelope list: [{ <as>: element, value | error }]
+  "onError": OnError? }        // how an element's failure is handled
+
+// ── Role 2 · Express ── one stream, transformed ───────────────────────────────────────────
+{ "source":  { "call": Call } | Ref,
+  "attach":  { "in": Ref, "on": Path, "match": Path?, "as": <name> }?,   // stage order is
+  "filter":  Predicate?,                                                   // fixed, not authored:
+  "dedup":   [ Path, … ]?,                                                 //   attach → filter
+  "fold":    Aggregator?,                                                  //   → dedup → fold
+  "result":  Projection?,      // element-wise on a stream; whole-value after a fold
+  "onError": OnError? }
+
+// ── Role 3 · Assemble ── a value built from bindings ──────────────────────────────────────
+{ "result": Projection? }      // omitted ⇒ the unique sink of `let`; values must be Refs (§10.4.1)
+                               // needs `let`, `result`, or both — a block with neither has no value
 ```
 
-#### 9.1.3 The simplest plan is three fields
+The leaf vocabularies, each closed:
+
+```jsonc
+Call       = { "service": <name>, "operation": <name>,          // §9.3.1
+               "args":     { <param>: Literal | Ref, … }?,       // the operation's input shape
+               "region":   Literal | Ref?,                       // which endpoint
+               "profile":  Literal?,                             // which identity; gated (§13.4)
+               "paginate": { "maxItems": <int>?, "maxPages": <int>?, "pageSize": <int>? }? }
+
+Ref        = { "ref":   <name>, "path": Path? }    // a binding or a traversal element — lexical
+           | { "input": <name>, "path": Path? }    // from the caller
+           | { "env":   <name>, "path": Path? }    // from the runtime (§12)
+           | { "token": <label> }                  // per task, by label
+
+Predicate  = { "key": Path, "op": Comparator, "value": Literal | Ref,
+               "transform": Transform?, "caseInsensitive": true? }
+           | { "and": [ Predicate, … ] } | { "or": [ Predicate, … ] } | { "not": Predicate }
+
+Comparator = eq | ne | startsWith | endsWith | contains     // string
+           | lt | lte | gt | gte                            // numeric
+           | present | absent                               // existence
+           | setEq | setNe | subset                         // projection (§10.3)
+
+Transform  = age | date | number | size | cidr | cidrSize
+
+Aggregator = "count" | { "sum": Path } | { "min": Path } | { "max": Path }
+           | { "collect": Path } | { "avg": Path } | { "distinctCount": Path }
+           | { "groupBy": { "key": Path, "aggregate": Aggregator } }
+           | { <field>: Aggregator, … }                     // product of aggregators (§10.2)
+
+Projection = [ Path, … ]                                    // pick, keeping the field names
+           | { <name>: Path | Ref | { "const": Literal }, … }   // pick and rename (§10.4.1)
+
+Path       = <member> ( "." <member> | "[]" | "[" <int> "]" )*   // plus `tag:<name>` pseudo-paths
+Inputs     = { <name>: { "type": "string" | "number" | "integer" | "boolean" | "array",
+                         "default": Literal? } }
+OnError    = "fail" | "skip" | "collect"
+```
+
+Three things this shape makes visible that a flat listing did not:
+
+- **What is shared and what is exclusive.** `let` and `expect` apply to any block; `onError` applies only where
+  calls happen; stages exist only in Express.
+- **Where each `result` points.** The same key means "over the envelope list", "element-wise on a stream", and
+  "assembled from bindings" in the three roles — the same projection grammar applied to three different subjects.
+- **How little there is.** Four stages, four reference kinds, fifteen comparators, six transforms, seven
+  aggregator constructors, three error policies. Everything else is composition.
+
+#### 9.1.3 The floor
+
+The smallest thing that is a plan: a version, a description, and something that produces a value.
 
 ```json
-{ "codemode": "v1",
-  "description": "running instances in us-east-1",
-  "source": { "call": { "service": "ec2", "operation": "describe-instances",
-                        "region": "us-east-1" } },
-  "filter": { "key": "State.Name", "op": "eq", "value": "running" },
-  "result": ["InstanceId", "InstanceType"] }
+{
+  "codemode": "v1",
+  "description": "enabled regions",
+  "source": {"call": {"service": "ec2", "operation": "describe-regions"}}
+}
 ```
 
-No `let`, no wrapper objects — four keys, one of which is the answer's shape. Three consequences matter more
-than the brevity:
+Three keys, and nothing else is required because everything else has a derivation or a default:
+
+| Absent                     | What happens                                                                                             |
+|----------------------------|----------------------------------------------------------------------------------------------------------|
+| `result`                   | the block's value is the call's records, unshaped — so the answer is whole records                       |
+| pruning                    | nothing inside the plan consumes this binding, and the consumer is the caller, so no field can be pruned |
+| `paginate`                 | defaults to `all` for a paginated operation, bounded by the run budget (§13.3)                           |
+| `filter`, `fold`, `expect` | absent means absent; there is no implicit behaviour to know about                                        |
+| `onError`                  | `fail` — a single call that fails fails the plan                                                         |
+
+Two things worth noticing about the floor.
+
+First, it is barely longer than `aws ec2 describe-regions`, which is the point: the ramp starts at zero, so
+there is no threshold below which a plan is the wrong tool. Second, the *only* thing missing that a reviewer
+would want is `result` — a plan with no `result` returns whole records, which is precisely why terminal shaping
+is the one projection that has to be authored (§10.4) rather than derived.
+
+#### 9.1.4 One step up
+
+Add a filter and a shape, and it is still one flat object:
+
+```json
+{
+  "codemode": "v1",
+  "description": "running instances in us-east-1",
+  "source": {"call": {"service": "ec2", "operation": "describe-instances", "region": "us-east-1"}},
+  "filter": {"key": "State.Name", "op": "eq", "value": "running"},
+  "result": ["InstanceId", "InstanceType"]
+}
+```
+
+No `let`, no wrapper objects — five keys, one of which is the answer's shape, and the `filter` will be lowered
+to `--filters Name=instance-state-name,Values=running` without the author knowing the parameter's name (§11.2).
+Three consequences matter more than the brevity:
 
 - **Code Mode becomes a superset of a single command rather than a mode with a threshold.** The agent never
   has to judge "is this big enough for a plan?" — a one-call plan is valid, not an error. The skill's
   quantitative trigger (§18.3) remains useful guidance, but misjudging it costs nothing.
-- **There is a smooth ramp**: one call → add a binding → add `forEach`. No rewrite at any boundary, which is
-  exactly where an agent would otherwise burn a turn.
+- **There is a smooth ramp**: floor → add a filter and a result → add a binding → add `forEach`. No rewrite at
+  any boundary, which is exactly where an agent would otherwise burn a turn.
 - **The machinery applies to single calls too.** `expect` on one paginated call is genuinely useful and has no
   equivalent in `aws … --query`, which cannot know that it truncated.
 
-#### 9.1.4 Why blocks rather than step kinds
+#### 9.1.5 Why blocks rather than step kinds
 
 An earlier draft had three step kinds (`call`, `fanOut`, `join`). That conflated **one effect** (`call`),
 **one combinator** (fan-out = traverse), and **one pure operation** (`join`) as siblings, so fields repeated
@@ -714,7 +846,7 @@ across them and nothing composed. With one block form and a canonical chain of s
 - `fold` after a single paginated `call` counts one bucket's objects — inexpressible when combining was a
   fan-out-only field.
 - `forEach` over a correlated stream needs no new kind.
-- `dedup` and `chunk` are stages rather than flags.
+- `dedup` is a stage rather than a flag.
 - Multi-step work per element is a nested block rather than an impossibility (§9.2.1).
 
 A-normal form is what keeps this authorable: one source, one stage record, references to other bindings.
@@ -729,10 +861,9 @@ There is no expression template syntax. A value is either a literal or a **refer
 closed union discriminated by its key:
 
 ```jsonc
-{ "let":   "regions", "path": "RegionName" }  // another binding's value, in scope
-{ "var":   "region" }                         // a traversal element, by its `as` name
-{ "var":   "region", "path": "Name" }         // a path within one
-{ "input": "tagKey" }                         // a plan or block parameter
+{ "ref":   "regions", "path": "RegionName" }  // a name in lexical scope: a binding …
+{ "ref":   "region" }                         // … or a traversal element, by its `as` name
+{ "input": "tagKey" }                         // a plan parameter
 { "env":   "ago", "path": "h24" }             // a runtime-provided value (§12)
 { "token": "snapshot" }                       // an idempotency token, by label
 ```
@@ -743,6 +874,15 @@ There are no sentinel values — no `null` standing for "no path", no boolean st
 path, so `{"item": null}` meant the element and `{"item": "Name"}` meant a field of it; naming traversal
 elements removes both the sentinel and the kind.
 
+There is **one kind for lexical scope and three external namespaces.** `ref` names anything in scope — a
+binding, or a traversal element by its `as` name — and the resolver looks it up rather than the author declaring
+which it is. That is sound because names are unique along the scope chain (§9.2.1): binding names and traversal
+variables share one namespace, so `{"ref": "region"}` cannot be ambiguous. An earlier draft split this into
+`let` and `var`, which made the author decide something the resolver already knows and made a name's spelling
+depend on where it happened to be introduced. `input`, `env`, and `token` stay separate because they are *not*
+lexically scoped: they come from the caller, the runtime, and the task respectively, and merging them would let
+a plan shadow a runtime value.
+
 `path` is a **path**, not an expression: member names, `[]` flattening, index and slice literals. No
 functions, no operators, no comparisons — comparison lives in `filter` (§10.3). A path is the largest
 construct that can still be type-checked against a response shape.
@@ -751,19 +891,31 @@ A reference **navigates only**. It carries no filter and no projection, because 
 reference does both, with a name attached and a line in `explain`. That keeps one place for filtering, one for
 shaping, and one for assembly.
 
-| Previously considered                                                 | Now                                                                    |
-|-----------------------------------------------------------------------|------------------------------------------------------------------------|
-| edges extracted by walking an expression AST; a missed edge is a race | edges are `{"let": …}` refs — read off the document                    |
-| `"${ … }"` templates collided with shell `${}` expansion              | no `$` appears in a plan at all                                        |
-| literal-vs-expression needed a delimiter convention                   | a literal is a scalar, a reference is an object; the JSON type decides |
-| paths validated at runtime                                            | paths type-checked against the block's known shape at parse time       |
+| Previously considered                                                 | Now                                                                                            |
+|-----------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| edges extracted by walking an expression AST; a missed edge is a race | edges are `{"ref": …}` references — read off the document                                      |
+| `"${ … }"` templates collided with shell `${}` expansion              | no `$` appears in a plan at all                                                                |
+| literal-vs-expression needed a delimiter convention                   | a reference is an object; a scalar is a literal in `args` and a path in a projection (§10.4.1) |
+| paths validated at runtime                                            | paths type-checked against the block's known shape at parse time                               |
 
 Semantics:
 
 - **Binding.** A binding's value is available to other bindings *in the same block* by name. Under `forEach`
-  it is a list in the input order of the traversed collection, one entry per element, each
-  `{ "item": <element>, "value": <result> }` — or `{ "item": …, "error": { … } }` under
-  `onError: "collect"`.
+  it is a list of envelope records in the input order of the traversed collection, one per element. The element
+  is carried under **the traversal's own `as` name**, and the outcome under `value` or, with
+  `onError: "collect"`, `error`:
+
+  ```jsonc
+  // for  "forEach": { "in": …, "as": "region", "do": … }
+  { "region": "us-east-1", "value": { … } }
+  { "region": "ap-east-1", "error": { "code": "AuthFailure", "retryable": false } }
+  ```
+
+  These are ordinary fields reached by ordinary paths — there is nothing magic about them, which is why
+  `{"key": "error", "op": "present"}` partitions a collected fan-out and `result: ["region", "value"]` shapes it.
+  Naming the element field after `as` rather than calling it `item` is what makes such a projection
+  self-explanatory: `{"region": "item"}` required knowing that "item" meant the traversed thing, while
+  `["region", "value"]` says it. Consequently `as` may not be `value` or `error`, which the validator checks.
 - **Ordering.** Nothing depends on document position (§9.1.1). Execution order comes from references and
   the read-then-mutate phase split (§4.2); the answer comes from `result` or the unique sink.
 - **Empty collections.** `forEach` over an empty collection succeeds with an empty list — the identity case
@@ -777,34 +929,45 @@ A traversal evaluates its whole block once per element, so multi-step per-elemen
 block's own `let`:
 
 ```json
-{ "codemode": "v1",
+{
+  "codemode": "v1",
   "description": "VPC and subnet inventory per enabled region",
   "let": {
     "regions": {
-      "source": { "call": { "service": "ec2", "operation": "describe-regions" } },
-      "filter": { "key": "OptInStatus", "op": "eq",
-                  "value": ["opt-in-not-required", "opted-in"] },
-      "expect": { "someRegions": { "key": "count", "op": "gt", "value": 0 } } },
-
+      "source": {"call": {"service": "ec2", "operation": "describe-regions"}},
+      "filter": {"key": "OptInStatus", "op": "eq", "value": ["opt-in-not-required", "opted-in"]},
+      "expect": {"someRegions": {"key": "count", "op": "gt", "value": 0}}
+    },
     "perRegion": {
-      "forEach": { "in": { "let": "regions", "path": "RegionName" }, "as": "region" },
-      "let": {
-        "subnets": { "source": { "call": { "service": "ec2", "operation": "describe-subnets",
-                                           "region": { "var": "region" } } } },
-        "vpcs":    { "source": { "call": { "service": "ec2", "operation": "describe-vpcs",
-                                           "region": { "var": "region" } } },
-                     "lookup": { "in": { "let": "subnets" }, "on": "VpcId", "as": "subnets" },
-                     "result": { "vpc":     "VpcId",
-                                 "cidr":    "CidrBlock",
-                                 "subnets": "subnets[].SubnetId" } }
+      "forEach": {
+        "in": {"ref": "regions", "path": "RegionName"},
+        "as": "region",
+        "do": {
+          "let": {
+            "subnets": {
+              "source": {
+                "call": {"service": "ec2", "operation": "describe-subnets", "region": {"ref": "region"}}
+              }
+            },
+            "vpcs": {
+              "source": {
+                "call": {"service": "ec2", "operation": "describe-vpcs", "region": {"ref": "region"}}
+              },
+              "attach": {"in": {"ref": "subnets"}, "on": "VpcId", "as": "subnets"},
+              "result": {"vpc": "VpcId", "cidr": "CidrBlock", "subnets": "subnets[].SubnetId"}
+            }
+          }
+        }
       },
-      "result": { "region": { "var": "region" }, "vpcs": { "let": "vpcs" } } }
-  } }
+      "result": {"region": {"ref": "region"}, "vpcs": {"ref": "vpcs"}}
+    }
+  }
+}
 ```
 
 `subnets` and `vpcs` are both evaluated per region, and the correlation happens per region — which is both
 correct and cheaper than correlating globally. Without nesting, this plan would have to fan out twice and then
-reconstruct region↔VPC pairs, the correlation gap that a `lookup` alone does not close.
+reconstruct region↔VPC pairs, the correlation gap that an `attach` alone does not close.
 
 Composition stays **applicative** (§10.1): the block is a fixed value and only the argument varies, so the call
 graph is still static and `explain` can still bound the call count — now as width × block cost.
@@ -817,14 +980,44 @@ Two rules keep it from becoming an expression tree:
 
 1. **Depth limit of 2.** Deeper is expressible by flattening and almost always means the plan wants
    restructuring; the parser rejects it rather than letting a model build a five-deep tree.
-2. **Scope is static and one-directional.** An inner binding sees outer bindings, outer traversal variables,
-   `inputs`, and `env`; an outer binding sees only the block's value. A cross-scope reference is a diagnostic,
-   and detecting it is mechanical because references are data. Shadowing is rejected outright, so a name means
-   one thing everywhere in a plan.
+2. **Scope is static and runs inward only.** Everything visible where a block is written is visible inside it:
+   the traversal variables of enclosing traversals, every binding of every enclosing block — including the
+   siblings of the binding it is written in — plus `inputs` and `env`. What is *not* visible is the inside of
+   another binding: a name local to `crawl`'s own `let` cannot be reached from outside `crawl`, only `crawl`'s
+   value can. That is the only cross-scope violation, and detecting it is mechanical because references are
+   data. Shadowing is rejected outright, so a name means one thing everywhere in a plan.
+
+A reference outward is an ordinary dependency edge, which has a useful consequence: **a binding named from
+inside a `do` is evaluated once**, before the traversal, and the same value is visible to every element. That is
+how a lookup table is broadcast rather than re-fetched per element:
+
+```json
+{
+  "let": {
+    "amis": {
+      "source": {"call": {"service": "ec2", "operation": "describe-images", "args": {"Owners": ["self"]}}}
+    },
+    "perRegion": {
+      "forEach": {
+        "in": {"ref": "regions", "path": "RegionName"},
+        "as": "region",
+        "do": {
+          "source": {"call": {"…": "…"}},
+          "attach": {"in": {"ref": "amis"}, "on": "ImageId", "as": "ami"}
+        }
+      }
+    }
+  }
+}
+```
+
+`amis` is fetched once and appears in an earlier wave in `explain`, not once per region. Where the helper is only
+meaningful to one traversal, putting it in a `let` *on the traversing block* rather than in the enclosing block
+scopes it accordingly — same single evaluation, narrower namespace.
 
 And two conventions that keep it legible:
 
-3. **Traversal elements are always named.** `as` is required, so `{"var": …}` is the only way to reach an
+3. **Traversal elements are always named.** `as` is required, so `{"ref": …}` is the only way to reach an
    element and nesting introduces no ambiguity to resolve. There is no implicit "innermost element" to reason
    about.
 4. **Prefer the flattest form that expresses the computation.** One validator rule covers both directions of
@@ -846,6 +1039,55 @@ Response data is always API-native (`Reservations`, `InstanceType`), exactly as 
 today. That asymmetry is real, is what the model has been trained on, and is called out explicitly in
 `help plan`; the normalizer removes the ambiguity from execution.
 
+#### 9.3.1 What goes in a `call`, and what does not
+
+A `call` has three distinct namespaces, and conflating them is the most likely early mistake:
+
+| Part                            | Contents                                                           |
+|---------------------------------|--------------------------------------------------------------------|
+| `service`, `operation`          | what to invoke                                                     |
+| `args`                          | the operation's input shape — **the only place API parameters go** |
+| `region`, `profile`, `paginate` | which endpoint, which identity, and pagination policy              |
+
+`region` is **not** an API parameter: no operation's input shape contains it, it selects the client and
+endpoint, and it takes no part in pushdown or field derivation. It is lifted to its own key because varying it
+is the canonical fan-out (§9.4); written in `args` it would simply fail validation against the model.
+
+`paginate` is policy, not parameters. The mechanics — `NextToken`, `MaxResults`, `Marker`, `Limit` — belong to
+the runtime, which takes them from the shipped paginator configuration (§11.1).
+
+Everything else is `args`, where names accept CLI style (`filters`) or API style (`Filters`) and normalize to
+API members (§9.3), values are literals or references, and nested structures are literal JSON matching the
+input shape. Because `args` values may be references, they participate in the dependency graph and in the
+derived field set like anything else.
+
+#### 9.3.2 What a plan may vary, and what only the invocation may
+
+The dividing line: **a plan may vary what changes the question; only the invocation may change trust and
+transport.**
+
+| Knob                                         | Where it may be set                              | Why                                                                                                                    |
+|----------------------------------------------|--------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| `region`                                     | in the plan, freely                              | changes which account-region is being asked about; every region contacted is listed in `explain`                       |
+| `profile`                                    | in the plan, gated by `--allow-profile-override` | changes *identity*, so the blast radius differs from what the plan text suggests (§13.4)                               |
+| endpoint URL                                 | **nowhere**                                      | a plan that could redirect API traffic to an arbitrary host is an exfiltration vector; excluding it is required by G10 |
+| request signing, TLS verification, CA bundle | invocation only                                  | security posture is the operator's decision, never the document's                                                      |
+| timeouts, retry mode, concurrency            | invocation only                                  | the governor owns them, and the right values are only knowable at run time (§13.1)                                     |
+| output format, `--query`                     | not applicable                                   | the envelope is the output contract, and `--query` is not the execution path (§11.2)                                   |
+
+#### 9.3.3 Who owns a parameter
+
+Two rules settle what happens when the runtime and the author both have a claim on the same input member:
+
+- **Pagination members are the runtime's.** `args` may not set `NextToken`, `MaxResults`, `Limit`, or `Marker`
+  for a paginated operation. The validator rejects it and points at `paginate`, because two writers on the
+  token chain is a correctness problem, not a style question.
+- **Author-written filters merge with lowered ones.** Writing `args.Filters` directly is a legitimate escape
+  hatch for a filter dimension the capability table does not model, so for **list-valued** filter parameters
+  the lowerer *appends* its pushed clauses — `Filters` are AND-composed, so appending is sound — and `explain`
+  shows both origins. For **scalar** parameters (`Prefix`, `FilterPattern`) a collision is an error naming both,
+  since silently preferring one would change the answer.
+
 ### 9.4 Worked example: multi-region fan-out
 
 Task: _"running instances tagged `Env=prod` across all enabled regions, grouped by instance type."_
@@ -856,30 +1098,46 @@ Task: _"running instances tagged `Env=prod` across all enabled regions, grouped 
   "description": "Running Env=prod instances per enabled region, counted by instance type",
   "let": {
     "regions": {
-      "source": { "call": { "service": "ec2", "operation": "describe-regions" } },
-      "filter": { "key": "OptInStatus", "op": "eq",
-                  "value": ["opt-in-not-required", "opted-in"] },
-      "expect": { "someRegions": { "key": "count", "op": "gt", "value": 0 } } },
-
+      "source": {"call": {"service": "ec2", "operation": "describe-regions"}},
+      "filter": {"key": "OptInStatus", "op": "eq", "value": ["opt-in-not-required", "opted-in"]},
+      "expect": {"someRegions": {"key": "count", "op": "gt", "value": 0}}
+    },
     "inst": {
-      "forEach": { "in": { "let": "regions", "path": "RegionName" }, "as": "region" },
-      "source": { "call": { "service": "ec2", "operation": "describe-instances",
-                            "region": { "var": "region" },
-                            "paginate": { "mode": "all", "maxItems": 5000 } } },
-      "filter": { "and": [ { "key": "tag:Env",    "op": "eq", "value": "prod" },
-                           { "key": "State.Name", "op": "eq", "value": "running" } ] },
-      "fold": { "groupBy": { "key": "InstanceType", "aggregate": "count" } },
-      "onError": "collect" },
-
-    "ok":     { "source": { "let": "inst" },
-                "filter": { "key": "value", "op": "present" },
-                "result": { "region": "item", "byType": "value" } },
-
-    "failed": { "source": { "let": "inst" },
-                "filter": { "key": "error", "op": "present" },
-                "result": { "region": "item", "code": "error.code" } }
+      "forEach": {
+        "in": {"ref": "regions", "path": "RegionName"},
+        "as": "region",
+        "do": {
+          "source": {
+            "call": {
+              "service": "ec2",
+              "operation": "describe-instances",
+              "region": {"ref": "region"},
+              "paginate": {"maxItems": 5000}
+            }
+          },
+          "filter": {
+            "and": [
+              {"key": "tag:Env", "op": "eq", "value": "prod"},
+              {"key": "State.Name", "op": "eq", "value": "running"}
+            ]
+          },
+          "fold": {"groupBy": {"key": "InstanceType", "aggregate": "count"}}
+        }
+      },
+      "onError": "collect"
+    },
+    "ok": {
+      "source": {"ref": "inst"},
+      "filter": {"key": "value", "op": "present"},
+      "result": ["region", "value"]
+    },
+    "failed": {
+      "source": {"ref": "inst"},
+      "filter": {"key": "error", "op": "present"},
+      "result": {"region": "region", "code": "error.code"}
+    }
   },
-  "result": { "byRegion": { "let": "ok" }, "failed": { "let": "failed" } }
+  "result": {"byRegion": {"ref": "ok"}, "failed": {"ref": "failed"}}
 }
 ```
 
@@ -904,7 +1162,7 @@ API filters. Cloud Custodian uses the same convention.
 that `onError: "collect"` makes necessary. Written as inline filters on the references inside `result` they
 would work too, but as bindings they get names, appear in `explain`, and can be reused.
 
-### 9.5 Worked example: DAG parallelism and a lookup
+### 9.5 Worked example: DAG parallelism and an attach
 
 Task: _"which running instances are in VPCs that have an internet gateway, and what are those VPCs named?"_
 
@@ -913,48 +1171,41 @@ Task: _"which running instances are in VPCs that have an internet gateway, and w
   "codemode": "v1",
   "description": "Running instances in internet-facing VPCs, with VPC names",
   "let": {
-    "vpcs": {
-      "source": { "call": { "service": "ec2", "operation": "describe-vpcs",
-                            "paginate": { "mode": "all" } } } },
-
+    "vpcs": {"source": {"call": {"service": "ec2", "operation": "describe-vpcs", "paginate": {}}}},
     "igwVpcs": {
-      "source": { "call": { "service": "ec2", "operation": "describe-internet-gateways",
-                            "paginate": { "mode": "all" } } },
+      "source": {"call": {"service": "ec2", "operation": "describe-internet-gateways", "paginate": {}}},
       "dedup": ["Attachments[].VpcId"],
-      "result": ["Attachments[].VpcId"] },
-
+      "result": ["Attachments[].VpcId"]
+    },
     "inst": {
-      "source": { "call": { "service": "ec2", "operation": "describe-instances",
-                            "paginate": { "mode": "all" } } },
-      "lookup": { "in": { "let": "vpcs" }, "on": "VpcId", "as": "vpc" },
-      "filter": { "and": [ { "key": "State.Name", "op": "eq", "value": "running" },
-                           { "key": "vpc", "op": "present" } ] },
-      "result": { "id":      "InstanceId",
-                  "type":    "InstanceType",
-                  "vpc":     "VpcId",
-                  "vpcName": "vpc[0].tag:Name" } }
+      "source": {"call": {"service": "ec2", "operation": "describe-instances", "paginate": {}}},
+      "attach": {"in": {"ref": "vpcs"}, "on": "VpcId", "as": "vpc"},
+      "filter": {
+        "and": [{"key": "State.Name", "op": "eq", "value": "running"}, {"key": "vpc", "op": "present"}]
+      },
+      "result": {"id": "InstanceId", "type": "InstanceType", "vpc": "VpcId", "vpcName": "vpc[0].tag:Name"}
+    }
   },
-  "result": { "instances": { "let": "inst" },
-              "internetFacingVpcs": { "let": "igwVpcs" } }
+  "result": {"instances": {"ref": "inst"}, "internetFacingVpcs": {"ref": "igwVpcs"}}
 }
 ```
 
 ```
 wave 1:  vpcs ∥ igwVpcs            (independent calls — no references between them)
-wave 2:  inst                      (its lookup reads vpcs)
+wave 2:  inst                      (its attach reads vpcs)
 ```
 
 Three things this example is doing at once:
 
-- **An inner join without a join.** `lookup` attaches the matching VPCs; `filter … "vpc" present` discards
+- **An inner join without a join.** `attach` attaches the matching VPCs; `filter … "vpc" present` discards
   instances whose VPC was not found. Both halves are operators that exist for other reasons (§10.1.1), so there
   is no `join` source and no `inner|left` enum.
-- **A pushdown split through the lookup.** The conjunction has one clause that does not mention `vpc`
-  (`State.Name eq running`) and one that does. The lowerer moves the first ahead of the lookup and then to the
-  service as `--filters Name=instance-state-name,Values=running`; the second stays after the lookup, where it
-  has to be. The author wrote one filter and did not have to know the difference (§11.2).
+- **A pushdown split through the attach.** The conjunction has one clause that does not mention `vpc`
+  (`State.Name eq running`) and one that does. The lowerer moves the first ahead of the attach and then to the
+  service as `--filters Name=instance-state-name,Values=running`; the second stays behind it, where it has to
+  be. The author wrote one filter and did not have to know the difference (§11.2).
 - **Paths stay API-native.** `InstanceId`, not `left.InstanceId`. The matched group sits under `vpc`, and
-  `vpc[0]` is explicit about the list, since a lookup key is not guaranteed unique.
+  `vpc[0]` is explicit about the list, since an attach key is not guaranteed unique.
 
 Because the block has two sinks — `inst` and `igwVpcs` — `result` is required rather than defaulted (§9.1).
 That is the rule working as intended: the answer here genuinely is a combination.
@@ -968,19 +1219,25 @@ Task: _"how many objects and how many bytes in each bucket?"_
   "codemode": "v1",
   "description": "Object count and total size per bucket",
   "let": {
-    "buckets": {
-      "source": { "call": { "service": "s3api", "operation": "list-buckets" } } },
-
+    "buckets": {"source": {"call": {"service": "s3api", "operation": "list-buckets"}}},
     "stats": {
-      "forEach": { "in": { "let": "buckets", "path": "Name" }, "as": "bucket" },
-      "source": { "call": { "service": "s3api", "operation": "list-objects-v2",
-                            "args": { "Bucket": { "var": "bucket" } },
-                            "paginate": { "mode": "all", "maxItems": 1000000,
-                                          "pageSize": 1000 } } },
-      "fold": { "objects": "count",
-                "bytes":   { "sum": "Size" },
-                "largest": { "max": "Size" } },
-      "onError": "collect" }
+      "forEach": {
+        "in": {"ref": "buckets", "path": "Name"},
+        "as": "bucket",
+        "do": {
+          "source": {
+            "call": {
+              "service": "s3api",
+              "operation": "list-objects-v2",
+              "args": {"Bucket": {"ref": "bucket"}},
+              "paginate": {"maxItems": 1000000, "pageSize": 1000}
+            }
+          },
+          "fold": {"objects": "count", "bytes": {"sum": "Size"}, "largest": {"max": "Size"}}
+        }
+      },
+      "onError": "collect"
+    }
   }
 }
 ```
@@ -1014,15 +1271,26 @@ vocabulary — applied to a small typed **outcome** object rather than to record
 ```
 
 ```json
-{ "let": {
-    "regions": { "source": { "call": { "…": "…" } },
-                 "expect": { "someRegions": { "key": "count", "op": "gt", "value": 0 } } },
-
-    "inst": { "forEach": { "in": { "let": "regions", "path": "RegionName" }, "as": "region" },
-              "source": { "call": { "…": "…" } },
-              "onError": "collect",
-              "expect": { "complete":  { "key": "truncated", "op": "absent" },
-                          "allRegions": { "key": "errors", "op": "empty" } } } } }
+{
+  "let": {
+    "regions": {
+      "source": {"call": {"…": "…"}},
+      "expect": {"someRegions": {"key": "count", "op": "gt", "value": 0}}
+    },
+    "inst": {
+      "forEach": {
+        "in": {"ref": "regions", "path": "RegionName"},
+        "as": "region",
+        "do": {"source": {"call": {"…": "…"}}}
+      },
+      "onError": "collect",
+      "expect": {
+        "complete": {"key": "truncated", "op": "absent"},
+        "allRegions": {"key": "errors", "op": "empty"}
+      }
+    }
+  }
+}
 ```
 
 Semantics:
@@ -1055,7 +1323,7 @@ each independently validatable, and each lowering to a different part of the exe
 
 | Algebra      | Answers                                          | Operations                                  | Lowers to                                                           |
 |--------------|--------------------------------------------------|---------------------------------------------|---------------------------------------------------------------------|
-| **Workflow** | what calls, in what order, with what parallelism | `call`, `forEach`, `lookup`, implicit `zip` | the scheduler (§13.1)                                               |
+| **Workflow** | what calls, in what order, with what parallelism | `call`, `forEach`, `attach`, implicit `zip` | the scheduler (§13.1)                                               |
 | **Combiner** | how many results become one                      | aggregators over monoids (§10.2)            | a streaming fold (§10.2)                                            |
 | **Query**    | which records, and which of their fields         | σ (`filter`) and π (`result`)               | server-side request params + residual client-side predicate (§11.2) |
 
@@ -1072,59 +1340,122 @@ composition over two shapes — a stream of records, or a single value:
 ```
 call     : Args                  -> Stream[Record]        -- the only effect
 deref    : Ref                   -> Stream[R] | One[T]     -- pure
-lookup   : (Ref, Path, Path, Name) -> Stream[R] -> Stream[R + {name: List[S]}]
+attach   : (Ref, Path, Path, Name) -> Stream[R] -> Stream[R + {as: List[S]}]
 filter   : Predicate    -> Stream[R] -> Stream[R]
 dedup    : List[Path]   -> Stream[R] -> Stream[R]
-chunk    : Int          -> Stream[R] -> Stream[List[R]]
 prune    : Set[Path]    -> Stream[R] -> Stream[R']      -- derived, not authored (§11.2)
 fold     : Aggregator -> Stream[R] -> One[T]
-forEach  : Ref -> (Item -> One[T]) -> Stream[{item, T}]   -- traverse
+forEach  : Ref -> Batch? -> (Item -> One[T]) -> Stream[{as, T}]   -- traverse; the function is `do`
 ```
 
 The stage keys sit directly on a block (§9.1) rather than inside a wrapper, and their composition order is
-fixed by the algebra rather than by the document — `lookup` → `filter` → `dedup` → `chunk` → `fold` — so
+fixed by the algebra rather than by the document — `attach` → `filter` → `dedup` → `fold` — so
 `filter` after `fold` is not an ordering a plan can express at all.
 
-`lookup` precedes `filter` so that a predicate may test what a lookup attached, which is how an inner join is
-expressed (§10.1.1). Filtering *before* the lookup, to reduce the work, is then an optimization the lowerer
+`attach` precedes `filter` so that a predicate may test what was attached, which is how an inner join is
+expressed (§10.1.1). Filtering *before* the attach, to reduce the work, is then an optimization the lowerer
 performs rather than a decision the author makes: conjuncts that do not mention the attached name move ahead of
-the lookup, and from there they are candidates for the server (§11.2).
+it, and from there they are candidates for the server (§11.2).
 
-#### 10.1.1 `lookup` is a fold and a probe
+#### 10.1.1 `attach`: what it means, and why it is an operator
 
-There is no `join` operator. A hash join is `groupBy(key, collect)` over one stream — an aggregator we already
-have (§10.2) — followed by a probe of that index per record of the other. Only the probe was missing, and that
-is `lookup`:
-
-```
-lookup{in: R, on: k, match: m, as: n}  ≡  probe(fold(R, groupBy(m, collect)), k, n)
-```
-
-Written as a desugaring, so it adds no algebra. What it removes is a source variant — `join` was the only
-source taking two inputs, and the only one producing a synthetic `{left, right}` shape that every path
-downstream had to know about. Records now keep their API-native shape and the matched group sits under its own
-name:
+`attach` adds no power. It names a shape that the primitives already express — which is the clearest way to
+state what it does. These two are equivalent:
 
 ```jsonc
-"lookup": { "in": { "let": "vpcs" }, "on": "VpcId", "as": "vpc" },
-"result": { "id": "InstanceId", "vpcName": "vpc[0].tag:Name" }
+"attach": { "in": { "ref": "vpcs" }, "on": "VpcId", "as": "vpc" }
 ```
 
-Three consequences:
+```json
+{
+  "forEach": {
+    "in": {"ref": "inst"},
+    "as": "i",
+    "do": {
+      "let": {
+        "vpc": {
+          "source": {"ref": "vpcs"},
+          "filter": {"key": "VpcId", "op": "eq", "value": {"ref": "i", "path": "VpcId"}}
+        }
+      }
+    }
+  },
+  "result": {"…": "…", "vpc": {"ref": "vpc"}}
+}
+```
 
-- **Join type is not a parameter.** A left join is a bare `lookup`; an inner join adds
-  `filter: {"key": "vpc", "op": "present"}`, which is an operator that already exists. The `inner|left` enum
-  disappears.
-- **Cardinality is one-to-one.** A lookup attaches the matching group to each record rather than emitting a
-  pair per match, so a stream keeps its length. A genuine cross-product is a `forEach` over the attached list,
-  which is expressible and rarely wanted.
-- **`match` defaults to `on`** when both sides key on the same path, which is the common case.
+Read aloud: *attach the records of `in` whose `match` path equals this record's `on` path, as the name
+`as`.* `match` defaults to `on`, which covers the common case of both sides keying on the same field.
 
-The attached value is a **list**, because a lookup against a non-unique key is genuinely ambiguous and
-silently taking the first match would be the wrong default. Hence `vpc[0]` above. Where the relationship
-metadata of §15.8 says the target path is a resource identifier — and therefore unique — the attached value is
-typed as at-most-one and `vpc.tag:Name` is accepted, so the index is needed only where uniqueness is genuinely
-unknown.
+Its implementation is the other desugaring — a fold and a probe, both of which we already have:
+
+```
+attach{in: R, on: k, match: m, as: n}  ≡  probe(fold(R, groupBy(m, collect)), k, n)
+```
+
+So a hash join is `groupBy(key, collect)` on one side (§10.2) and a probe per record of the other. Only the
+probe was missing.
+
+**Why it is an operator rather than sugar.** The primitive form is correct but has three problems that a named
+operator avoids:
+
+| Problem with the written-out form                                    | Why it matters                                                                                                                                                           |
+|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| It is O(n×m) unless the interpreter decorrelates it into a hash join | The failure mode is *quadratic*, not merely slower. §11.2 can promise that pushdown failures only cost pages; a missed decorrelation costs 50M comparisons on 10k × 5k.  |
+| Decorrelation depends on *recognizing* the shape                     | A slight variation falls off the fast path silently — the same "unpredictable magic" objection that ruled out analysing a general expression language for pushdown.      |
+| `forEach` makes one task per element                                 | Tasks are the unit of concurrency, error policy, and `explain`'s width estimate, so a pure stream transform would report "fans out over 10,000 elements" and degrade G2. |
+
+**What it is not called, and why.** Not `join`: a join emits a row per match, while this attaches matches to one
+row, so the familiar name would promise the wrong cardinality. Not `lookup`, which an earlier draft used: that
+describes what the author is doing rather than what happens to the record. `attach` says exactly what happens
+and promises nothing about cardinality.
+
+**`as` is the shared binder abstraction.** Both `forEach` and `attach` introduce a name for a value produced
+by their `in` source, so making the author learn two words for that role would be a distinction without a useful
+decision. The containing operator determines the name's scope:
+
+- `forEach.as` binds the current element into the lexical scope of `do`, read as `{"ref": …}`.
+- `attach.as` binds the matched group into each output record, read as a path (`vpc[0].tag:Name`).
+
+They are not the same storage location, but they are the same **language concept**: name this operator's
+introduced value for its continuation. Reusing `as` says that intentionally. It is also preferable to `into`,
+which suggests mutating a record even though every stage is a pure transformation (§17.2).
+
+Three consequences of the shape:
+
+- **Join type is not a parameter.** A left join is a bare `attach`; an inner join adds
+  `filter: {"key": "vpc", "op": "present"}`, an operator that already exists. The `inner|left` enum disappears.
+- **Cardinality is preserved.** A stream keeps its length. A genuine cross-product is a `forEach` over the
+  attached list, which is expressible and rarely wanted.
+- **Paths stay API-native.** `InstanceId`, never `left.InstanceId`. The matched group sits under its own name,
+  so no synthetic pair shape exists for paths or for field derivation (§11.2) to see through.
+
+The attached value is a **list**, because a match against a non-unique key is genuinely ambiguous and silently
+taking the first would be the wrong default — hence `vpc[0].tag:Name`. Where the relationship metadata of §15.8
+says the target path is a resource identifier, and therefore unique, the attached value is typed as at-most-one
+and `vpc.tag:Name` is accepted. The index is needed only where uniqueness is genuinely unknown.
+
+#### 10.1.2 `forEach` and `attach` are not siblings
+
+They resemble each other because both must name a source and a target, and because `attach` is *defined* in
+terms of `forEach` (above). The resemblance is parent-and-special-case, not kinship. Three axes separate them —
+how many times code runs, the shape of each value, and what happens to the environment:
+
+|                     | `forEach`                                                           | `attach`                                              |
+|---------------------|---------------------------------------------------------------------|-------------------------------------------------------|
+| Kind                | higher-order: takes a block as its body (`do`)                      | a stage: `Stream[R] → Stream[R′]`                     |
+| Position            | wraps the per-element block                                         | inside the chain, after `source`                      |
+| `in` is             | the block's *only* input                                            | a *second* input, correlated with the existing stream |
+| Run count           | the body runs once per element                                      | the block runs once; each record is rewritten         |
+| Cardinality         | output length = the element count                                   | length preserved, records widened                     |
+| Names bind into     | **scope** — a name, read as `{"ref": …}`                            | **the record** — a field, read by path                |
+| Creates tasks       | yes: the unit of concurrency, error policy, budget, `explain` width | no: pure, zero calls                                  |
+| Introduces a scope  | yes                                                                 | no                                                    |
+| Functional analogue | `traverse : (a → f b) → t a → f (t b)`                              | `map` closed over an index                            |
+
+In one line: **`forEach` changes how many times the block runs; `attach` changes what each record contains.**
+That is why one is a wrapper that owns concurrency and error policy, and the other is a stage that needs
+neither.
 
 Pagination is not a separate concept: `call` yields a *stream* of records, and `paginate` bounds that stream.
 Pages are an implementation detail of the source, which is why every downstream operator works identically
@@ -1145,7 +1476,7 @@ are data-dependent. That single property is what buys, rather than merely permit
 - **Renderability** — a plan is a value describing effects, so `explain` renders it without running it, and
   no `--dry-run` mode is needed.
 
-A `lookup` is `zip` followed by pure correlation: the looked-up binding is independent of the one probing it, so
+An `attach` is `zip` followed by pure correlation: the attached binding is independent of the one probing it, so
 both run concurrently, and the correlation itself has no effects — which is why it is a stage rather than a
 source, and why it needs no error policy of its own.
 
@@ -1211,7 +1542,8 @@ What the laws license, precisely:
 `filter` is σ. Its terms form a **Boolean lattice** over atomic predicates:
 
 ```jsonc
-<predicate> ::= { "key": <path>, "op": <op>, "value": <literal|ref>, "transform": <transform>?, "i": true? }
+<predicate> ::= { "key": <path>, "op": <op>, "value": <literal|ref>,
+                  "transform": <transform>?, "caseInsensitive": true? }
               | { "and": [<predicate>, …] }
               | { "or":  [<predicate>, …] }
               | { "not":  <predicate> }
@@ -1245,12 +1577,14 @@ Normalization handles nesting in three passes, and each pass has a consequence w
 
 1. **Negation is pushed to the atoms** by De Morgan, converting each comparator to its complement:
    `eq↔ne`, `lt↔gte`, `gt↔lte`, `present↔absent`, `setEq↔setNe`. The set is *almost* closed under
-   complement — `startsWith`, `endsWith`, `contains`, `subset`, and `properSubset` have no named opposite —
+   complement — `startsWith`, `endsWith`, `contains`, and `subset` have no named opposite —
    so a `not` over one of those stays wrapped and is residual-only. That is a real limitation and it is better
    stated than papered over with five more comparators nobody would remember.
 2. **Same-operator nesting is flattened** by associativity (`and[and[a,b],c]` → `and[a,b,c]`), and
-   single-operand `and`/`or` nodes are elided. This is part of the canonicalization that makes two
-   textually different but logically identical predicates normalize to the same form.
+   single-operand `and`/`or` nodes are elided. Also, an `or` of `eq` atoms on the *same key* with literal values
+   collapses into one atom with an array value — canonicalization runs *toward* the array form, because that is
+   the form that corresponds to a server-side `Values` list. The author may write either spelling; the lowerer
+   sees one, so §11.2's same-key pushdown is mechanical rather than a shape it has to recognize.
 3. **The result is conjunctive normal form**: a set of clauses, each a disjunction of literals. Clauses are the
    unit of pushdown (§11.2), which is why nesting costs nothing at the surface — the author writes the shape
    that reads naturally and the lowerer sees clauses either way.
@@ -1258,31 +1592,63 @@ Normalization handles nesting in three passes, and each pass has a consequence w
 **Comparators, borrowed from Smithy selectors** (§10.5), because that vocabulary already answers a question a
 path-based predicate language must answer: what does a comparison mean when the path yields *many* values?
 
-| Kind      | Operators                                    | Semantics                                                |
-|-----------|----------------------------------------------|----------------------------------------------------------|
-| String    | `eq` `ne` `startsWith` `endsWith` `contains` | string comparison; `"i": true` makes it case-insensitive |
-| Numeric   | `lt` `lte` `gt` `gte`                        | both sides must be valid numbers, else no match          |
-| Existence | `present` `absent`                           | tests for a value's existence; no `value` field          |
-| Set       | `setEq` `setNe` `subset` `properSubset`      | both sides are projections; set relations                |
+| Kind      | Operators                                    | Semantics                                                  |
+|-----------|----------------------------------------------|------------------------------------------------------------|
+| String    | `eq` `ne` `startsWith` `endsWith` `contains` | string comparison; `caseInsensitive` normalizes both sides |
+| Numeric   | `lt` `lte` `gt` `gte`                        | both sides must be valid numbers, else no match            |
+| Existence | `present` `absent`                           | tests for a value's existence; no `value` field            |
+| Set       | `setEq` `setNe` `subset`                     | both sides are projections; set relations                  |
 
 - **A path that yields multiple values is a projection.** Comparing a projection to a scalar matches **if any
   value satisfies** the comparator. So `{"key": "SecurityGroups[].GroupId", "op": "eq", "value": "sg-123"}`
   means "has that group" — the intuitive reading, now specified rather than implied.
-- **A `value` that is an array means "any of"** for the scalar comparators. `{"key": "OptInStatus", "op": "eq",
-  "value": ["opt-in-not-required", "opted-in"]}` matches either, and `ne` against an array means "none of".
-  This is Smithy's comma-separated comparison rule, and it is why there is no separate `in` operator: a
-  membership test is equality against alternatives. The set comparators are the exception — there the array is
-  one set rather than a list of alternatives, which is exactly why they have their own names.
+- **A `value` that is an array means "any of"**, for `eq`, `ne`, and the string matchers.
+  `{"key": "OptInStatus", "op": "eq", "value": ["opt-in-not-required", "opted-in"]}` matches either. This is
+  Smithy's comma-separated comparison rule, and it is why there is no separate `in` operator: a membership test
+  is equality against alternatives. It is also the shape the server uses — an EC2 `Filters` entry is
+  `{Name, Values: […]}` with OR *within* a filter — so an array value lowers to exactly one filter (§11.2),
+  which is why the same-key disjunction is the pushable one.
+  - `ne` against an array is the De Morgan dual: "none of", an AND of inequalities. Same syntax, opposite
+    connective, which is what "not in" ought to mean but is worth stating.
+  - **Arrays are rejected for the ordering comparators.** `{"op": "lt", "value": [10, 20]}` would read as "less
+    than 10 or less than 20", which is just "less than 20" — degenerate, so it is a validation error rather
+    than something silently collapsed.
+  - A single-element array normalizes to a scalar. A literal empty array is the empty disjunction, hence
+    *false* for `eq` and *true* for `ne`; written literally in the document it is dead code, so it warns.
+    Arriving from an `input` default it does not, because intent cannot be known.
+- **When both sides are many, the comparison is existential on both sides** — that is, the sets *intersect*.
+  `{"key": "SecurityGroups[].GroupId", "op": "eq", "value": ["sg-1", "sg-2"]}` matches a resource in either
+  group. That is Smithy's rule for projection-against-projection, and it is defensible, but it is also the one
+  place a reader might plausibly expect "equals" or "contains all". If either of those is what you mean, say so
+  with a set comparator; their existence is precisely because this case is ambiguous in the abstract.
 - **Set relations are their own operators**, not overloads of equality. This is a real factoring improvement
   over an earlier draft's `in`/`notIn`/`contains`/`intersects`, which conflated "scalar in set" with "set
   overlaps set" and left the many-valued case undefined.
 - **Existence is a comparator**, not a magic value, so `absent` cannot be confused with `eq null`.
-- **Case-insensitivity is a modifier**, not a parallel set of operators.
+- **Case-insensitivity is a modifier**, not a parallel set of operators — and it is spelled out rather than
+  abbreviated. Smithy writes it as a trailing `i` because Smithy is a compact textual DSL; in JSON, where every
+  other key of a predicate is a word, a single letter is an outlier that a reader has to look up.
+
+  It subsumes what a `lower` transform would do, which is why there isn't one. A `transform` applies to the left
+  side only, with the author supplying a value already in the transformed domain — that is how
+  `{"key": "LaunchTime", "op": "lt", "transform": "age", "value": 32}` works. A one-sided lowercase would
+  therefore require a lowercase literal, and break as soon as the comparison value is a reference whose case the
+  author does not control. `caseInsensitive` normalizes *both* sides.
+
+  It also **forces the clause residual** (§11.2). Server-side filter values are case-sensitive, so pushing a
+  case-insensitive predicate into one would silently match fewer records — the wrong-pushdown trap, in its most
+  innocuous-looking form. An API that documents case-insensitive matching for a given filter can be marked as
+  such in the capability table; absent that, the comparison happens in-process.
 
 `transform` is the escape valve for the value-level computation the algebra deliberately lacks:
-`age` `date` `integer` `number` `lower` `size` `count` `cidr` `cidrSize`. `{"key": "LaunchTime", "op": "lt",
-"transform": "age", "value": 32}` is "launched in the last 32 days", with no arithmetic anywhere. The
-vocabulary is enumerated, so each transform can be reasoned about for pushdown and rendered in `explain`.
+`age` `date` `number` `size` `cidr` `cidrSize`. `{"key": "LaunchTime", "op": "lt", "transform": "age",
+"value": 32}` is "launched in the last 32 days", with no arithmetic anywhere. The vocabulary is enumerated, so
+each transform can be reasoned about for pushdown and rendered in `explain`.
+
+Three transforms an earlier draft carried are gone, each because something else already did the job: `lower` is
+redundant with `caseInsensitive` and strictly weaker (one-sided rather than both-sided); `count` duplicated
+`size` for records and `expect.count` for outcomes; and `integer` versus `number` was a distinction with no
+consequence for a comparison.
 
 Two properties come from this being a lattice rather than a language:
 
@@ -1300,9 +1666,30 @@ small set of shape constructors:
 ```jsonc
 "result": ["VolumeId", "Size"]                                  // pick fields
 "result": { "id": "VolumeId", "az": "AvailabilityZone" }        // rename
-"result": { "byRegion": { "let": "ok" }, "failed": { "let": "failed" } }
+"result": { "byRegion": { "ref": "ok" }, "failed": { "ref": "failed" } }
 ```
 
+
+#### 10.4.1 What a string means in a projection
+
+A projection's values are **paths**, written bare. That is a different default from `args`, where a scalar is a
+literal, and the difference is deliberate: an argument's job is to *supply* a value, so a value is the default;
+a projection's job is to *select*, so selection is the default. Since it is a positional rule, it is worth
+stating in full:
+
+| Written                                    | In `args` / `filter.value`           | In a projection                                     |
+|--------------------------------------------|--------------------------------------|-----------------------------------------------------|
+| `"InstanceId"`                             | the literal string                   | a path into the current record                      |
+| `{"ref": …}`, `{"input": …}`, `{"env": …}` | a reference                          | the same reference                                  |
+| `{"const": "instance"}`                    | (unnecessary — scalars are literals) | a literal, for the rare case a projection needs one |
+
+**When a reference is required rather than optional.** A bare path needs a current record to resolve against,
+which exists only when the block has a `source`. A `let`-only block has nothing streaming through it, so in its
+`result` a bare string is a validation error and every value must be a reference — which is why §9.2.1's
+`perRegion` writes `{"ref": "region"}` and not `"region"`. Conversely §9.4's `failed` writes `"region"` as a
+path, because after the traversal the element *is* a field of the envelope record (§9.2). Both spellings appear
+in this document and neither is redundant: one reads a field, the other reads a scope variable, and only one of
+them is available in each case.
 
 A `path` is a **traversal** in the optics sense: `VolumeId` focuses one value, `Instances[].InstanceId`
 focuses many, and composition is associative. That is the algebraic reason paths type-check — a traversal
@@ -1323,7 +1710,7 @@ A projection stage would have straddled the first two, which is why there isn't 
 block's value is a stream, `result` shapes it element-wise; if a `fold` reduced it to one value, `result`
 shapes that value. Either way it applies at the block's boundary, never mid-computation.
 
-On naming: the stages are `filter`, `dedup`, `chunk`, `fold`, and the first two follow CloudWatch Logs
+On naming: the stages are `attach`, `filter`, `dedup`, `fold`, and the middle two follow CloudWatch Logs
 Insights — a pipeline query language over AWS data whose stages are `fields`, `filter`, `stats … by …`, `sort`,
 `limit`. An earlier draft had a `fields` stage borrowed from it; deriving pruning removed the need for one, so
 the borrowed name now applies to nothing and the authored projection is `result`. `fold` deliberately does not
@@ -1389,17 +1776,29 @@ splitting, truncation) has no home in any of the three algebras, and stays with 
 
 ```jsonc
 "paginate": {
-  "mode": "all" | "first" | "limit",   // default: "all" for paginated ops
-  "maxItems": 5000,                    // required when mode = "limit"; capped by budget
-  "pageSize": 1000                     // hint; clamped to the operation's legal range
+  "maxItems": 5000,     // stop after this many records; capped by the run budget
+  "maxPages": 1,        // stop after this many requests
+  "pageSize": 1000      // hint; clamped to the operation's legal range
 }
 ```
+
+Each bound is optional, and an absent bound means *unbounded, subject to the run budget* (§13.3). An earlier
+draft had a `mode` enum — `all` / `first` / `limit` — which this replaces:
+
+| Was                                  | Now                               |
+|--------------------------------------|-----------------------------------|
+| `{"mode": "all"}`                    | `{}`, or omit `paginate` entirely |
+| `{"mode": "first"}`                  | `{"maxPages": 1}`                 |
+| `{"mode": "limit", "maxItems": 200}` | `{"maxItems": 200}`               |
+
+That removes an enum and the conditional rule that `maxItems` was required for one of its members, and it is
+strictly more expressive: `maxPages: 2` had no spelling before.
 
 - Whether an operation paginates, and what its tokens/limit keys are, comes from the shipped service
   models (the CLI's existing paginator configuration) — the plan does not describe pagination
   mechanics, only policy.
-- `mode: "all"` is bounded by the run budget for total items and bytes (§13.3). Hitting the bound
-  stops that step and records a truncation, it does not error.
+- An unbounded `paginate` is still bounded by the run budget for total items and bytes (§13.3). Hitting either
+  the plan's bound or the budget stops that binding and records a truncation; it does not error.
 - Derived pruning runs per page, before retention. Combined with `fold`, `mode: "all"` over a huge listing
   is memory-safe.
 - Pagination is sequential per task (token chaining) and parallel across fan-out tasks.
@@ -1416,7 +1815,7 @@ learn several hundred filter dialects.
 
 **Deriving the field set.** Before any lowering, the demanded fields of each binding are computed by
 traversing the document: every `path` on a reference to it, every `filter.key`, every `fold` path, every
-`lookup` key on either side, every `expect` key, and every path in a `result` that names it. Because references
+`attach` key on either side, every `expect` key, and every path in a `result` that names it. Because references
 are data (§9.2), this is a traversal rather than an analysis — no over-approximation and no guessing.
 
 Three properties matter:
@@ -1453,9 +1852,9 @@ a difference. Explicit keys are always available when a narrower notion of ident
    The validator warns on the third shape, because a cross-key disjunction silently turns a cheap query into a
    full scan and the author may not have intended a disjunction at all.
 3. Pushable clauses become request parameters — `Filters`, `TagFilters`, `Prefix`, `FilterPattern`, key
-   conditions, whatever this API calls them. Where a `lookup` precedes the filter, clauses that do not mention
+   conditions, whatever this API calls them. Where an `attach` precedes the filter, clauses that do not mention
    the attached name move ahead of it first (§10.1.1), which is what makes them candidates for the server at
-   all; clauses that test the lookup necessarily stay behind it.
+   all; clauses that test what was attached necessarily stay behind it.
 4. Everything else becomes the **residual predicate**, evaluated in-process per page, before pruning and
    `fold` (§4.1) so residual filtering still reduces retained bytes.
 5. The derived field set is lowered the same way where the API supports projection; otherwise pruning happens
@@ -1570,9 +1969,10 @@ ordinary operation invocation, appears in the call log, and is skipped when unre
 
 **Graph construction** (in the normalizer, before any call):
 
-1. Collect every `{"let": …}` reference, per block. Because references are data rather than expression syntax
+1. Collect every `{"ref": …}` that resolves to a binding, per block. Because references are data rather than expression syntax
    (§9.2), this is a traversal of the parsed plan, not an analysis of a language: no over-approximation, no
-   shadowing, no possibility of a missed edge. `var`, `item`, `token`, `env`, and `input` references name
+   shadowing, no possibility of a missed edge. A `ref` that resolves to a traversal element, and `token`,
+   `env`, and `input` references, name
    arguments rather than bindings, so they create no edges. A nested block is one node in its parent's graph
    and carries its own graph inside; a reference that names a binding in another scope is rejected here rather
    than at run time.
@@ -1685,14 +2085,14 @@ wave 1  (1 binding)
 
 wave 2  (1 binding)
   perRegion  forEach over regions.RegionName  as region   ~17 elements
-             block, per element:
+             do (per element):
                wave 1  (2 bindings in parallel)
                  vpcs     ec2:DescribeVpcs     region=$region  paginate all  ~1 call
-                          fields: VpcId, CidrBlock            (derived from lookup, result)
+                          fields: VpcId, CidrBlock            (derived from attach, result)
                  subnets  ec2:DescribeSubnets  region=$region  paginate all  ~1-3 calls
-                          fields: SubnetId, VpcId             (derived from lookup key, result)
+                          fields: SubnetId, VpcId             (derived from attach key, result)
                wave 2  (1 binding)
-                 vpcs     lookup subnets on VpcId as subnets   no extra calls
+                 vpcs     attach subnets on VpcId as subnets  no extra calls
                result:  { region, vpcs }
 
 regions contacted: 17 (derived from regions)
@@ -1728,7 +2128,7 @@ contacts nothing.
     "expectations": [ { "binding": "inst", "predicate": "truncated absent", "held": true } ],
     "env": { "now": "2026-08-27T20:59:00Z", "accountId": "…" },
     "truncated": [ { "binding": "stats", "reason": "maxItems", "retrieved": 100000 } ],
-    "errors":    [ { "binding": "inst", "item": "ap-east-1", "code": "AuthFailure", "message": "…" } ],
+    "errors":    [ { "binding": "inst", "element": "ap-east-1", "code": "AuthFailure", "message": "…" } ],
     "warnings":  [ { "binding": "inst", "code": "ClientSideFilter", "message": "…" } ]
   }
 }
@@ -1976,7 +2376,7 @@ Design points:
 - **Filterability is stated, not implied.** Each entry names the operators the capability table supports and,
   where the names differ, the request parameter it lowers to. The agent does not need this to write a valid
   plan — the compiler decides — but seeing it lets the agent *choose* a shape that pushes down.
-- **Relationships make `lookup` authorable and checkable.** This is the metadata Cypher-style tooling exists to
+- **Relationships make `attach` authorable and checkable.** This is the metadata Cypher-style tooling exists to
   provide; exposing it here gives the correlation capability without adopting a graph query language or
   materializing a graph (§20.9).
 - Compact signature notation rather than JSON Schema — 5–10× fewer tokens for the same information — with
@@ -1995,13 +2395,17 @@ error  let.inst.filter.and[0].key          'Encrypted' is not a field of ec2:Des
                                           (see: schema ec2:DescribeInstances)
 error  let.inst.filter.and[1].op           'greaterThan' is not a comparator
                                           comparators: eq ne startsWith endsWith contains | lt lte gt gte |
-                                          present absent | setEq setNe subset properSubset
+                                          present absent | setEq setNe subset
 error  let.vols.filter                     Size: gt expects a number, got "large"
-error  let.stats.forEach                   {"let":"buckets"} is not a defined binding (defined: regions, inst)
+error  let.stats.forEach.in                {"ref":"buckets"} is not a defined name (defined: regions, inst)
 error  let.report.fold                     "fold" requires "source"; there is no stream to fold
-error  let.x.let.y.args.Bucket             {"let":"buckets"} is not in scope here (defined in the enclosing
-                                          block; inner blocks read outer bindings, but this names a sibling
-                                          of the enclosing binding)
+error  let.summary.result.region           bare paths need a record; this block has no "source", so every
+                                          result value must be a reference (did you mean {"ref": "region"}?)
+error  let.summary.onError                 "onError" needs "source" or "forEach"; this block assembles
+                                          bindings and makes no calls, so it has no failures of its own
+error  let.report.args.Prefix              {"ref":"pages"} is not in scope here; it is local to "crawl".
+                                          Scope runs inward only: hoist "pages" to this block, or read
+                                          "crawl" itself
 error  let.x.let.y                         name "vols" shadows a binding in an enclosing scope; names must be
                                           unique along the scope chain
 error  let.empty                           a block needs at least one of "source", "let", or "result"
@@ -2030,7 +2434,7 @@ a query language for exactly this: **selectors**, a DSL for matching shapes in a
 |-------------------------------|----------------------------------|-----------------------------------------------------|
 | Paths, records, pagination    | typing, pruning, `paginate`      | the `paginated` trait; input/output shape traversal |
 | Filterable fields + operators | pushdown (§11.2)                 | operation input members plus filter conventions     |
-| Relationships                 | `lookup` (§9.1), `schema` output | resource identifier and lifecycle relationships     |
+| Relationships                 | `attach` (§9.1), `schema` output | resource identifier and lifecycle relationships     |
 | Read-only classification      | mutation gate (§13.4)            | the `readonly` trait; resource lifecycle bindings   |
 
 The selectors that produce them are ordinary model queries:
@@ -2045,7 +2449,7 @@ service ~> operation :not([trait|readonly])                  # mutating operatio
 
 The last two matter most. Smithy has **first-class `resource` shapes** with `identifier`, `property`, and
 `create`/`read`/`update`/`delete`/`list`/`put` lifecycle relationships. That is the resource-graph ontology
-`lookup` needs and the read-only signal §13.4 needs — declared by the service teams, not invented by us. It is
+`attach` needs and the read-only signal §13.4 needs — declared by the service teams, not invented by us. It is
 also, notably, the ontology that graph-based cloud tooling spends years assembling by hand (§20.9).
 
 How it ships:
@@ -2060,7 +2464,7 @@ How it ships:
   (§11.2) before it is used for pushdown. Derivation improves coverage and reduces toil; it does not lower the
   bar for correctness.
 - **Both degrade safely.** A missing filterability entry means residual client-side filtering. A missing
-  relationship means the agent states lookup keys explicitly. Neither absence can produce a wrong answer.
+  relationship means the agent states attach keys explicitly. Neither absence can produce a wrong answer.
 
 The layer distinction is worth restating because it is easy to lose: selectors query the *model*; `filter`
 (§10.3) queries the *data* the model describes. Selectors cannot express `State.Name == "running"` — there is
@@ -2083,12 +2487,12 @@ The execution model carried over unchanged. Findings that shaped this spec:
 - **Model output needed defensive parsing.** The prototype's `Workflow.parse` strips markdown fences
   before deserializing, because the planner wrapped its JSON in ```` ```json ```` regularly. §8.1.2
   makes that tolerance an explicit, warned behaviour rather than an undocumented hack.
-- **Naming each step's output and the fan-out element was learned from a short grammar plus one example.**
-  The prototype used `$<id>` and `$item` because JSONata has variables; §9.2 uses `{"let": …}` and
-  `{"var": …}` reference objects instead. The lesson that transferred is that *one* short grammar plus *one* worked
+- **Naming each binding's value and the traversal element was learned from a short grammar plus one example.**
+  The prototype used `$<id>` and `$item` because JSONata has variables; §9.2 uses the single lexical
+  `{"ref": …}` form for both. The lesson that transferred is that *one* short grammar plus *one* worked
   example suffices — not the specific syntax.
-- **Returning `{item, output}` pairs from fan-out** turned out to be essential: the final projection
-  needs the input key (there, the symbol; here, the region) to make sense of each result.
+- **Returning `{<as>: element, value|error}` envelopes from fan-out** turned out to be essential: the final
+  projection needs the input key (there, the symbol; here, the region) to make sense of each result.
 - **Concurrency must not be in the plan.** The prototype fixed `maxConcurrency=6` in the interpreter
   and instructed the planner to never mention concurrency; the resulting plans were stable.
 - **Binding-level parallelism was left on the table.** The prototype executed its steps strictly
@@ -2157,40 +2561,49 @@ The three algebras are three closed type hierarchies, and parsing is the only wa
 
 ```
 Plan        = (Version, Description, Inputs, Block)
-Block       = ( ForEach?, Map[Name, Block], Expr?, Projection?, Map[Label, Predicate], OnError )
-ForEach     = (In: Ref, As: VarName, Batch: Int?)         -- grouped: meaningless apart
-Expr        = (Source, Stages)
+Block       = ( Let: Map[Name, Block], Expect: Map[Label, Predicate], Role )
+Role        = Traverse(ForEach, Projection?, OnError)      -- one of three; see the table in §9.1
+            | Express(Source, Stages, Projection?, OnError)
+            | Assemble(Projection?)                        -- no stages, no OnError: it makes no calls
+ForEach     = (In: Ref, As: VarName, Batch: Int?, Do: Block)   -- the body is explicit
 Source      = Call(Service, Operation, Args, Region?, Paginate?) | Deref(Ref)
-Stages      = ( Lookup: (Ref, Path, Path, Name)?, Filter: Predicate?, Dedup: List[Path]?,
-                Chunk: Int?, Fold: Aggregator? )          -- fixed composition order; flat on the wire
-Ref         = LetRef(Name, Path?) | VarRef(VarName, Path?) | InputRef(Name, Path?)
-            | EnvRef(Name, Path?) | TokenRef(Label)         -- one shape: a name plus an optional path
-Predicate   = Atom(Path, Comparator, Value, Transform?, CaseInsensitive)
+Stages      = ( Attach: (In: Ref, On: Path, Match: Path, As: Name)?, Filter: Predicate?,
+                Dedup: List[Path]?, Fold: Aggregator? )   -- fixed composition order; flat on the wire
+Ref         = ScopeRef(Name, Path?)                          -- a binding or a traversal element
+            | InputRef(Name, Path?) | EnvRef(Name, Path?) | TokenRef(Label)
+                                                             -- one shape: a name plus an optional path
+Predicate   = Atom(Path, Comparator, Value, Transform?, CaseInsensitive: Bool)
             | And(NonEmpty[Predicate]) | Or(NonEmpty[Predicate]) | Not(Predicate)
 Comparator  = Eq | Ne | StartsWith | EndsWith | Contains        -- string
             | Lt | Lte | Gt | Gte                               -- numeric
             | Present | Absent                                  -- existence
-            | SetEq | SetNe | Subset | ProperSubset              -- projection
+            | SetEq | SetNe | Subset                            -- projection
 Aggregator  = (Prepare, Monoid, Present)
 Monoid      = Sum | Semilattice(Order) | Free | SetUnion | MapOf(Monoid) | Product(Map[Field, Monoid])
-Paginate    = All(MaxItems, PageSize?) | First(PageSize?) | Limit(MaxItems, PageSize?)
+Paginate    = (MaxItems: Int?, MaxPages: Int?, PageSize: Int?)  -- absent bound = budget-bounded
 OnError     = Fail | Skip | Collect
 ```
 
 There is no `Binding` type: a binding is a `Block` at a name, so `Block` is the only structural type and `Plan`
 is a `Block` with a version and a description. Local bindings and an expression are *both* optional members
 rather than a union, because they are orthogonal (§9.1) — which is what let nesting be `let` inside `let` and
-removed the `Nested` source variant. `Stages` is a **record of optional stages** rather than a list, which makes
-stage order canonical (§10.1) and "filter after fold" unwriteable rather than an arity error to diagnose; it is
-a member of `Expr` in the type while being flat in the document, the same relationship `Plan` has to `Block`,
-and the reason the parser is where flat keys become structure.
+removed the `Nested` source variant.
 
-**A note on where unrepresentability was traded for checks.** Two collapses moved rules out of the types: making
-the stage keys flat means "stages without a source" is a check rather than a variant, and making `let` and
-`source` orthogonal means "neither present" is a check rather than an impossibility. Both trades bought real
-expressiveness (a shallower document; `let` alongside `source`) and both checks have one obvious message. The
-pattern is worth watching, though: a third collapse of the same kind would start to erode the property that
-§17.1 exists to state. `Filter` is one
+`Role` is a **union over the three shapes a block can take** (§9.1), so the combinations a flat ten-key record
+would admit — stages without a source, `forEach` beside `source`, `onError` on a block that makes no calls — are
+unrepresentable rather than checked. It carries **no discriminator field**: presence of `ForEach` versus `Source`
+decides the branch, so the generated schema is a `oneOf` and the document stays exactly as flat as §9.1.2 shows.
+`Stages` is likewise a record rather than a list, which makes stage order canonical (§10.1) and "filter after
+fold" unwriteable. Both are members of a variant in the type while being flat on the wire — the same
+relationship `Plan` has to `Block`, and the reason the parser is where flat keys become structure.
+
+**A note on unrepresentability versus checks.** An earlier draft of this spec collapsed the block forms into one
+flat record and moved three rules into prose — stages needing a source, `forEach` excluding `source`, and a block
+needing some value-provider. `Role` puts them back into the types at no cost to the document, which is the
+outcome worth generalizing: **a flat wire format and a structured type are not in tension, because a JSON Schema
+`oneOf` can discriminate on which keys are present rather than on a tag.** When a collapse seems to force rules
+out of the types, the question to ask first is whether the union simply needs to be written down without a
+discriminator field. `Filter` is one
 `Predicate`, so conjunction is always the lattice's own `And` rather than an implicit property of a container.
 There is no projection stage: the pruned field set is *derived* (§11.2) and lives on `ValidPlan` as something
 parsing learned, while the authored `Projection` is the block's optional `result`.
@@ -2228,7 +2641,7 @@ What the encoding removes rather than adds:
 - **`Ref` has one shape across all five kinds** — a name and an optional path — so there are no sentinel
   values to encode "no path" or "the whole thing", and `path` has one meaning everywhere. `ForEach` groups
   `In`/`As`/`Batch` for the opposite reason the stage keys are flat: those are meaningful independently, these
-  are not, and a `forEach` missing its `as` should be unwriteable rather than checked.
+  are not, and a `forEach` missing its `as` or its `do` should be unwriteable rather than checked.
 - **Name-keyed maps are parsed with a duplicate-key hook.** `json` silently keeps the last of a repeated key,
   so `{"vpcs": …, "vpcs": …}` would otherwise lose a binding without complaint. The hook makes it a
   diagnostic, in `let`, `expect`, `inputs`, and `args` alike.
@@ -2303,7 +2716,7 @@ using selectors** (§15.8), with a reviewed override file for what the models do
 - **Shape/pagination/record paths** — typing for paths, pruning, and `paginate`.
 - **Filterability** — per operation, which paths are server-filterable, by which operators, with which
   semantics. Each entry is gated on a differential test (§11.2).
-- **Relationships and lifecycle** — the edges that make `lookup` authorable and checkable, and the read-only
+- **Relationships and lifecycle** — the edges that make `attach` authorable and checkable, and the read-only
   classification that §13.4's mutation gate and §4.2.1's barriers depend on.
 
 Generation is a build step whose output is data, so the runtime has no Smithy dependency. The override file is
@@ -2327,17 +2740,17 @@ authoritative; the skill only triggers the lookup.**
 Structured into addressable topics so an agent pulls only what it needs, and available as JSON for
 machine consumption:
 
-| Topic       | Contents                                                                                                                                                    | Budget       |
-|-------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------|
-| (default)   | What it is, when to use it vs single commands, the subcommands, the minimum viable plan, and the topic index                                                | ~600 tokens  |
-| `plan`      | One block form: a flat record of optional keys — `let`, `source` + stages, `result`; references; `expect`; error policies — JSON Schema via `--output json` | ~1200 tokens |
-| `passing`   | How to hand a plan to the CLI: heredoc, single-quoted inline, `file://`; the shell-quoting hazard of §8.1.1                                                 | ~250 tokens  |
-| `query`     | Predicates: the `op` and `transform` vocabularies, `and`/`or`/`not`, paths and pseudo-paths, projections, and which predicates push server-side             | ~900 tokens  |
-| `combiners` | The monoid vocabulary, what each expects and produces, and product combiners                                                                                | ~250 tokens  |
-| `errors`    | `onError` semantics, error taxonomy, partial results, truncation, exit codes                                                                                | ~500 tokens  |
-| `examples`  | 4 worked plans: single chain, multi-region fan-out, independent-reads DAG, parallel fold                                                                    | ~1200 tokens |
-| `schema`    | One lookup call, many queries; keywords not questions; the signature notation; the vocabulary it knows                                                      | ~500 tokens  |
-| `limits`    | Budgets, defaults, and which are overridable                                                                                                                | ~200 tokens  |
+| Topic       | Contents                                                                                                                                            | Budget       |
+|-------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|--------------|
+| (default)   | What it is, when to use it vs single commands, the subcommands, the minimum viable plan, and the topic index                                        | ~600 tokens  |
+| `plan`      | One block form: the floor is three keys; `let`, `source` + stages, `result`; references; `expect`; error policies — JSON Schema via `--output json` | ~1200 tokens |
+| `passing`   | How to hand a plan to the CLI: heredoc, single-quoted inline, `file://`; the shell-quoting hazard of §8.1.1                                         | ~250 tokens  |
+| `query`     | Predicates: the `op` and `transform` vocabularies, `and`/`or`/`not`, paths and pseudo-paths, projections, and which predicates push server-side     | ~900 tokens  |
+| `combiners` | The monoid vocabulary, what each expects and produces, and product combiners                                                                        | ~250 tokens  |
+| `errors`    | `onError` semantics, error taxonomy, partial results, truncation, exit codes                                                                        | ~500 tokens  |
+| `examples`  | 4 worked plans: single chain, multi-region fan-out, independent-reads DAG, parallel fold                                                            | ~1200 tokens |
+| `schema`    | One lookup call, many queries; keywords not questions; the signature notation; the vocabulary it knows                                              | ~500 tokens  |
+| `limits`    | Budgets, defaults, and which are overridable                                                                                                        | ~200 tokens  |
 
 Requirements on this output:
 
@@ -2480,217 +2893,300 @@ split (§4.2.1) and `token`. It would require `--allow-mutations` to run.
 {
   "codemode": "v1",
   "description": "Quarterly account hygiene sweep (grammar conformance fixture)",
-
   "inputs": {
-    "env":        { "type": "string",  "default": "prod" },
-    "staleDays":  { "type": "integer", "default": 90 },
-    "logPrefix":  { "type": "string",  "default": "/aws/lambda/" },
-    "paramNames": { "type": "array",   "default": [] }
+    "env": {"type": "string", "default": "prod"},
+    "staleDays": {"type": "integer", "default": 90},
+    "logPrefix": {"type": "string", "default": "/aws/lambda/"},
+    "paramNames": {"type": "array", "default": []}
   },
-
   "let": {
     "regions": {
-      "source": { "call": { "service": "ec2", "operation": "describe-regions" } },
-      "filter": { "key": "OptInStatus", "op": "eq",
-                  "value": ["opt-in-not-required", "opted-in"] },
-      "expect": { "someRegions": { "key": "count", "op": "gt", "value": 0 } }
+      "source": {"call": {"service": "ec2", "operation": "describe-regions"}},
+      "filter": {"key": "OptInStatus", "op": "eq", "value": ["opt-in-not-required", "opted-in"]},
+      "expect": {"someRegions": {"key": "count", "op": "gt", "value": 0}}
     },
-
     "insts": {
-      "forEach": { "in": { "let": "regions", "path": "RegionName" }, "as": "region" },
-      "source": { "call": { "service": "ec2", "operation": "describe-instances",
-                            "region": { "var": "region" },
-                            "paginate": { "mode": "all", "maxItems": 5000, "pageSize": 1000 } } },
-      "filter": { "and": [
-        { "key": "tag:Env", "op": "eq", "value": { "input": "env" }, "i": true },
-        { "or": [ { "key": "State.Name", "op": "eq", "value": ["running", "stopped"] },
-                  { "key": "InstanceType", "op": "startsWith", "value": "t2." } ] },
-        { "not": { "key": "tag:Ephemeral", "op": "present" } },
-        { "key": "LaunchTime", "op": "gt", "transform": "age", "value": { "input": "staleDays" } },
-        { "key": "Tags", "op": "lt", "transform": "size", "value": 10 }
-      ] },
-      "fold": { "groupBy": { "key": "InstanceType", "aggregate": "count" } },
+      "forEach": {
+        "in": {"ref": "regions", "path": "RegionName"},
+        "as": "region",
+        "do": {
+          "source": {
+            "call": {
+              "service": "ec2",
+              "operation": "describe-instances",
+              "region": {"ref": "region"},
+              "paginate": {"maxItems": 5000, "pageSize": 1000}
+            }
+          },
+          "filter": {
+            "and": [
+              {"key": "tag:Env", "op": "eq", "value": {"input": "env"}, "caseInsensitive": true},
+              {
+                "or": [
+                  {"key": "State.Name", "op": "eq", "value": ["running", "stopped"]},
+                  {"key": "InstanceType", "op": "startsWith", "value": "t2."}
+                ]
+              },
+              {"not": {"key": "tag:Ephemeral", "op": "present"}},
+              {
+                "key": "LaunchTime",
+                "op": "gt",
+                "transform": "age",
+                "value": {"input": "staleDays"}
+              },
+              {"key": "Tags", "op": "lt", "transform": "size", "value": 10}
+            ]
+          },
+          "fold": {"groupBy": {"key": "InstanceType", "aggregate": "count"}}
+        }
+      },
       "onError": "collect",
-      "expect": { "notTruncated": { "key": "truncated", "op": "absent" } }
+      "expect": {"notTruncated": {"key": "truncated", "op": "absent"}}
     },
-
     "staleByRegion": {
-      "source": { "let": "insts" },
-      "filter": { "key": "value", "op": "present" },
-      "result": { "region": "item", "byType": "value" }
+      "source": {"ref": "insts"},
+      "filter": {"key": "value", "op": "present"},
+      "result": {"region": "region", "byType": "value"}
     },
-
     "instErrors": {
-      "source": { "let": "insts" },
-      "filter": { "key": "error", "op": "present" },
-      "result": { "region": "item", "code": "error.code", "retryable": "error.retryable" }
+      "source": {"ref": "insts"},
+      "filter": {"key": "error", "op": "present"},
+      "result": {"region": "region", "code": "error.code", "retryable": "error.retryable"}
     },
-
     "vols": {
-      "source": { "call": { "service": "ec2", "operation": "describe-volumes",
-                            "paginate": { "mode": "all" } } },
-      "filter": { "and": [
-        { "key": "Encrypted", "op": "eq", "value": false },
-        { "key": "Size", "op": "gte", "value": 100 },
-        { "key": "State", "op": "ne", "value": ["deleting", "error"] },
-        { "key": "Attachments[].State", "op": "subset", "value": ["attached", "attaching"] },
-        { "or": [ { "key": "Tags[].Key", "op": "setNe", "value": ["Owner"] },
-                  { "key": "Tags[].Key", "op": "properSubset", "value": ["Owner", "Env", "Team"] } ] },
-        { "key": "SnapshotId", "op": "endsWith", "value": "0" },
-        { "key": "AvailabilityZone", "op": "contains", "value": "us-" }
-      ] },
+      "source": {"call": {"service": "ec2", "operation": "describe-volumes", "paginate": {}}},
+      "filter": {
+        "and": [
+          {"key": "Encrypted", "op": "eq", "value": false},
+          {"key": "Size", "op": "gte", "value": 100},
+          {"key": "State", "op": "ne", "value": ["deleting", "error"]},
+          {"key": "Attachments[].State", "op": "subset", "value": ["attached", "attaching"]},
+          {
+            "or": [
+              {"key": "Tags[].Key", "op": "setNe", "value": ["Owner"]},
+              {
+                "and": [
+                  {"key": "Tags[].Key", "op": "subset", "value": ["Owner", "Env", "Team"]},
+                  {"not": {"key": "Tags[].Key", "op": "setEq", "value": ["Owner", "Env", "Team"]}}
+                ]
+              }
+            ]
+          },
+          {"key": "SnapshotId", "op": "endsWith", "value": "0"},
+          {"key": "AvailabilityZone", "op": "contains", "value": "us-"}
+        ]
+      },
       "dedup": ["VolumeId"]
     },
-
     "volStats": {
-      "source": { "let": "vols" },
-      "fold": { "n":        "count",
-                "bytes":    { "sum": "Size" },
-                "biggest":  { "max": "Size" },
-                "smallest": { "min": "Size" },
-                "meanSize": { "avg": "Size" },
-                "zones":    { "distinctCount": "AvailabilityZone" },
-                "ids":      { "collect": "VolumeId" },
-                "byZone":   { "groupBy": { "key": "AvailabilityZone", "aggregate": "count" } } }
+      "source": {"ref": "vols"},
+      "fold": {
+        "n": "count",
+        "bytes": {"sum": "Size"},
+        "biggest": {"max": "Size"},
+        "smallest": {"min": "Size"},
+        "meanSize": {"avg": "Size"},
+        "zones": {"distinctCount": "AvailabilityZone"},
+        "ids": {"collect": "VolumeId"},
+        "byZone": {"groupBy": {"key": "AvailabilityZone", "aggregate": "count"}}
+      }
     },
-
     "snaps": {
-      "source": { "call": { "service": "ec2", "operation": "describe-snapshots",
-                            "args": { "OwnerIds": ["self"] },
-                            "paginate": { "mode": "all", "maxItems": 20000 } } }
+      "source": {
+        "call": {
+          "service": "ec2",
+          "operation": "describe-snapshots",
+          "args": {"OwnerIds": ["self"]},
+          "paginate": {"maxItems": 20000}
+        }
+      }
     },
-
     "volSnap": {
-      "source": { "let": "vols" },
-      "lookup": { "in": { "let": "snaps" }, "on": "VolumeId", "as": "snapshots" },
-      "result": { "volume":    "VolumeId",
-                  "size":      "Size",
-                  "snapshots": "snapshots[].SnapshotId",
-                  "newest":    "snapshots[0].StartTime" }
+      "source": {"ref": "vols"},
+      "attach": {"in": {"ref": "snaps"}, "on": "VolumeId", "as": "snapshots"},
+      "result": {
+        "volume": "VolumeId",
+        "size": "Size",
+        "snapshots": "snapshots[].SnapshotId",
+        "newest": "snapshots[0].StartTime"
+      }
     },
-
-    "volChunks": {
-      "source": { "let": "vols" },
-      "chunk": 200,
-      "result": ["VolumeId"]
-    },
-
     "volStatus": {
-      "forEach": { "in": { "let": "volChunks" }, "as": "chunk" },
-      "source": { "call": { "service": "ec2", "operation": "describe-volume-status",
-                            "args": { "VolumeIds": { "var": "chunk" } } } },
-      "onError": "skip",
-      "result": ["VolumeId", "VolumeStatus.Status"]
+      "forEach": {
+        "in": {"ref": "vols", "path": "VolumeId"},
+        "as": "volIds",
+        "batch": 200,
+        "do": {
+          "source": {
+            "call": {
+              "service": "ec2",
+              "operation": "describe-volume-status",
+              "args": {"VolumeIds": {"ref": "volIds"}}
+            }
+          },
+          "result": ["VolumeId", "VolumeStatus.Status"]
+        }
+      },
+      "onError": "skip"
     },
-
     "logGroups": {
-      "source": { "call": { "service": "logs", "operation": "describe-log-groups",
-                            "args": { "logGroupNamePrefix": { "input": "logPrefix" } },
-                            "paginate": { "mode": "limit", "maxItems": 200, "pageSize": 50 } } },
-      "filter": { "and": [ { "key": "storedBytes", "op": "gt", "value": 0 },
-                           { "key": "retentionInDays", "op": "absent" } ] },
+      "source": {
+        "call": {
+          "service": "logs",
+          "operation": "describe-log-groups",
+          "args": {"logGroupNamePrefix": {"input": "logPrefix"}},
+          "paginate": {"maxItems": 200, "pageSize": 50}
+        }
+      },
+      "filter": {
+        "and": [
+          {"key": "storedBytes", "op": "gt", "value": 0},
+          {"key": "retentionInDays", "op": "absent"}
+        ]
+      },
       "result": ["logGroupName", "storedBytes"]
     },
-
     "params": {
-      "forEach": { "in": { "input": "paramNames" }, "as": "nameBatch", "batch": 10 },
-      "source": { "call": { "service": "ssm", "operation": "get-parameters",
-                            "args": { "Names": { "var": "nameBatch" }, "WithDecryption": false } } },
-      "onError": "skip",
-      "result": ["Name", "Type"]
-    },
-
-    "perRegionNet": {
-      "forEach": { "in": { "let": "regions", "path": "RegionName" }, "as": "region" },
-      "let": {
-        "subnets": { "source": { "call": { "service": "ec2", "operation": "describe-subnets",
-                                           "region": { "var": "region" } } } },
-        "vpcs":    { "source": { "call": { "service": "ec2", "operation": "describe-vpcs",
-                                           "region": { "var": "region" } } },
-                     "lookup": { "in": { "let": "subnets" }, "on": "VpcId", "as": "subnets" },
-                     "result": { "vpc":     "VpcId",
-                                 "cidr":    "CidrBlock",
-                                 "subnets": "subnets[].SubnetId" } }
+      "forEach": {
+        "in": {"input": "paramNames"},
+        "as": "nameBatch",
+        "batch": 10,
+        "do": {
+          "source": {
+            "call": {
+              "service": "ssm",
+              "operation": "get-parameters",
+              "args": {"Names": {"ref": "nameBatch"}, "WithDecryption": false}
+            }
+          },
+          "result": ["Name", "Type"]
+        }
       },
-      "result": { "region": { "var": "region" }, "vpcs": { "let": "vpcs" } }
+      "onError": "skip"
     },
-
+    "perRegionNet": {
+      "forEach": {
+        "in": {"ref": "regions", "path": "RegionName"},
+        "as": "region",
+        "do": {
+          "let": {
+            "subnets": {
+              "source": {
+                "call": {"service": "ec2", "operation": "describe-subnets", "region": {"ref": "region"}}
+              }
+            },
+            "vpcs": {
+              "source": {
+                "call": {"service": "ec2", "operation": "describe-vpcs", "region": {"ref": "region"}}
+              },
+              "attach": {"in": {"ref": "subnets"}, "on": "VpcId", "as": "subnets"},
+              "result": {"vpc": "VpcId", "cidr": "CidrBlock", "subnets": "subnets[].SubnetId"}
+            }
+          }
+        }
+      },
+      "result": {"region": {"ref": "region"}, "vpcs": {"ref": "vpcs"}}
+    },
     "tagVols": {
-      "forEach": { "in": { "let": "vols", "path": "VolumeId" }, "as": "volId" },
-      "source": { "call": { "service": "ec2", "operation": "create-tags",
-                            "args": { "Resources": [ { "var": "volId" } ],
-                                      "Tags": [ { "Key": "HygieneReview",
-                                                  "Value": { "env": "today" } } ] } } },
+      "forEach": {
+        "in": {"ref": "vols", "path": "VolumeId"},
+        "as": "volId",
+        "do": {
+          "source": {
+            "call": {
+              "service": "ec2",
+              "operation": "create-tags",
+              "args": {
+                "Resources": [{"ref": "volId"}],
+                "Tags": [{"Key": "HygieneReview", "Value": {"env": "today"}}]
+              }
+            }
+          }
+        }
+      },
       "onError": "fail"
     },
-
+    "taggedOk": {
+      "source": {"ref": "tagVols"},
+      "filter": {"key": "value", "op": "present"},
+      "result": ["volId"]
+    },
     "runbook": {
-      "forEach": { "in": { "let": "tagVols", "path": "item" }, "as": "taggedVol" },
-      "filter": { "key": "value", "op": "present" },
-      "source": { "call": { "service": "ssm", "operation": "start-automation-execution",
-                            "args": { "DocumentName": "AWS-CreateSnapshot",
-                                      "Parameters": { "VolumeId": [ { "var": "taggedVol" } ] },
-                                      "ClientToken": { "token": "runbook" } } } },
+      "forEach": {
+        "in": {"ref": "taggedOk", "path": "volId"},
+        "as": "taggedVol",
+        "do": {
+          "source": {
+            "call": {
+              "service": "ssm",
+              "operation": "start-automation-execution",
+              "args": {
+                "DocumentName": "AWS-CreateSnapshot",
+                "Parameters": {"VolumeId": [{"ref": "taggedVol"}]},
+                "ClientToken": {"token": "runbook"}
+              }
+            }
+          }
+        }
+      },
       "onError": "fail"
     }
   },
-
   "result": {
-    "runId":          { "env": "runId" },
-    "asOf":           { "env": "now" },
-    "window":         { "env": "ago", "path": "d90" },
-    "staleInstances": { "let": "staleByRegion" },
-    "regionErrors":   { "let": "instErrors" },
-    "volumes":        { "let": "volStats" },
-    "volumeSnapshots": { "let": "volSnap" },
-    "volumeStatus":   { "let": "volStatus" },
-    "logGroups":      { "let": "logGroups" },
-    "parameters":     { "let": "params" },
-    "network":        { "let": "perRegionNet" }
+    "runId": {"env": "runId"},
+    "asOf": {"env": "now"},
+    "window": {"env": "ago", "path": "d90"},
+    "staleInstances": {"ref": "staleByRegion"},
+    "regionErrors": {"ref": "instErrors"},
+    "volumes": {"ref": "volStats"},
+    "volumeSnapshots": {"ref": "volSnap"},
+    "volumeStatus": {"ref": "volStatus"},
+    "logGroups": {"ref": "logGroups"},
+    "parameters": {"ref": "params"},
+    "network": {"ref": "perRegionNet"}
   },
-
-  "expect": { "hasFindings": { "key": "count", "op": "gt", "value": 0 } }
+  "expect": {"hasFindings": {"key": "count", "op": "gt", "value": 0}}
 }
 ```
 
 ### 21.1 Coverage
 
-| Construct                                                                                                                    | Where                                                   |
-|------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------|
-| plan = block + `codemode`, `description`, `inputs`                                                                           | top level                                               |
-| typed `inputs` with defaults, including an array                                                                             | `env`, `staleDays`, `logPrefix`, `paramNames`           |
-| `let` as a name-keyed map                                                                                                    | top level and inside `perRegionNet`                     |
-| `source` + stages (an expression)                                                                                            | most bindings                                           |
-| `let` + `result` (bindings and a value)                                                                                      | top level; `perRegionNet`                               |
-| `source: call` with `args`, `region`, `paginate`                                                                             | `insts`, `snaps`, `logGroups`                           |
-| `lookup` with `on` (inner via a `present` filter)                                                                            | `volSnap`, `perRegionNet.joined`                        |
-| `source: <ref>` (pure, no calls)                                                                                             | `staleByRegion`, `instErrors`, `volStats`, `volChunks`  |
-| nesting via `let` inside `let` (depth 2)                                                                                     | `perRegionNet`                                          |
-| `forEach` record (`in`/`as`) with `{"var": …}`                                                                               | `insts`, `perRegionNet`, `tagVols`                      |
-| `forEach` with `batch`                                                                                                       | `params` (SSM `Names` caps at 10)                       |
-| `forEach` whose `in` is an `input` reference                                                                                 | `params`                                                |
-| `chunk` feeding a later `forEach`                                                                                            | `volChunks` → `volStatus`                               |
-| `paginate` all / limit, `maxItems`, `pageSize`                                                                               | `insts`, `vols`, `logGroups`                            |
-| `filter` single atom                                                                                                         | `regions`, `staleByRegion`, `instErrors`                |
-| `filter` with nested `and` / `or` / `not`                                                                                    | `insts`, `vols`                                         |
-| array value = "any of"                                                                                                       | `regions.OptInStatus`, `insts.State.Name`, `vols.State` |
-| comparators: `eq` `ne` `gt` `gte` `lt` `startsWith` `endsWith` `contains` `present` `absent` `subset` `properSubset` `setNe` | `insts`, `vols`, `logGroups`                            |
-| `transform` (`age`, `size`)                                                                                                  | `insts`                                                 |
-| case-insensitive `i`                                                                                                         | `insts.tag:Env`                                         |
-| pseudo-path `tag:<name>`                                                                                                     | `insts`, `tagVols`                                      |
-| projection path with `[]` flattening                                                                                         | `vols.Attachments[].State`, `vols.Tags[].Key`           |
-| `dedup` with explicit keys                                                                                                   | `vols`                                                  |
-| `fold` with `groupBy`                                                                                                        | `insts`, `volStats.byZone`                              |
-| `fold` product with `count` `sum` `min` `max` `avg` `distinctCount` `collect`                                                | `volStats`                                              |
-| `result` list form                                                                                                           | `volStatus`, `logGroups`, `params`, `volChunks`         |
-| `result` map form with paths                                                                                                 | `staleByRegion`, `volSnap`, `perRegionNet.joined`       |
-| `result` omitted, defaulting to the unique sink                                                                              | `perRegionNet.source.block` (→ `joined`)                |
-| `result` at plan level assembling refs                                                                                       | top level                                               |
-| references: `let`, `var`, `input`, `env`, `token`, each with optional `path`                                                 | throughout                                              |
-| `expect` on a binding and on the plan                                                                                        | `regions`, `insts`, top level                           |
-| `onError` `fail` / `skip` / `collect`                                                                                        | `tagVols`, `params`, `insts`                            |
-| ordering between mutations via a data dependency                                                                             | `runbook` after `tagVols`                               |
-| mutating operations (requires `--allow-mutations`)                                                                           | `tagVols`, `runbook`                                    |
+| Construct                                                                                                     | Where                                                            |
+|---------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------|
+| plan = block + `codemode`, `description`, `inputs`                                                            | top level                                                        |
+| typed `inputs` with defaults, including an array                                                              | `env`, `staleDays`, `logPrefix`, `paramNames`                    |
+| `let` as a name-keyed map                                                                                     | top level and inside `perRegionNet`                              |
+| `source` + stages (an expression)                                                                             | most bindings                                                    |
+| `let` + `result` (bindings and a value)                                                                       | top level; `perRegionNet`                                        |
+| `source: call` with `args`, `region`, `paginate`                                                              | `insts`, `snaps`, `logGroups`                                    |
+| `source: <ref>` (pure, no calls)                                                                              | `staleByRegion`, `instErrors`, `volStats`, `volSnap`, `taggedOk` |
+| `attach` with `on`/`as`                                                                                       | `volSnap`, `perRegionNet.vpcs`                                   |
+| `forEach` with `in`/`as`/`do`, read via `{"ref": …}`                                                          | `insts`, `perRegionNet`, `tagVols`, `runbook`                    |
+| `forEach` with `batch`                                                                                        | `params` (SSM `Names` caps at 10); `volStatus` (200 ids)         |
+| `forEach` whose `in` is an `input` reference                                                                  | `params`                                                         |
+| nesting: `let` inside `let` (depth 2)                                                                         | `perRegionNet`                                                   |
+| `forEach` with `batch` (no separate chunk stage)                                                              | `volStatus` (200 ids), `params` (10 names)                       |
+| `paginate` bounds: `maxItems`, `pageSize`                                                                     | `insts`, `vols`, `logGroups`                                     |
+| `filter` single atom                                                                                          | `regions`, `staleByRegion`, `instErrors`                         |
+| `filter` with nested `and` / `or` / `not`                                                                     | `insts`, `vols`                                                  |
+| array value = "any of"                                                                                        | `regions.OptInStatus`, `insts.State.Name`, `vols.State`          |
+| comparators: `eq` `ne` `gt` `gte` `lt` `startsWith` `endsWith` `contains` `present` `absent` `subset` `setNe` | `insts`, `vols`, `logGroups`                                     |
+| `transform` (`age`, `size`)                                                                                   | `insts`                                                          |
+| `caseInsensitive` modifier                                                                                    | `insts.tag:Env`                                                  |
+| pseudo-path `tag:<name>`                                                                                      | `insts`, `tagVols`                                               |
+| path with `[]` flattening                                                                                     | `vols.Attachments[].State`, `volSnap.snapshots[]`                |
+| `dedup` with explicit keys                                                                                    | `vols`                                                           |
+| `fold` with `groupBy`                                                                                         | `insts`, `volStats.byZone`                                       |
+| `fold` product with `count` `sum` `min` `max` `avg` `distinctCount` `collect`                                 | `volStats`                                                       |
+| `result` list form                                                                                            | `volStatus`, `logGroups`, `params`, `taggedOk`                   |
+| `result` map form with paths                                                                                  | `staleByRegion`, `volSnap`, `perRegionNet`                       |
+| `result` omitted, defaulting to the unique sink                                                               | `perRegionNet.vpcs` is the sink of its `let`                     |
+| `result` at plan level assembling refs                                                                        | top level                                                        |
+| references: lexical `ref`, external `input`/`env`/`token`, each with optional `path`                          | throughout                                                       |
+| `expect` on a binding and on the plan                                                                         | `regions`, `insts`, top level                                    |
+| `onError` `fail` / `skip` / `collect`                                                                         | `tagVols`, `params`, `insts`                                     |
+| mutation ordering via a data dependency                                                                       | `runbook` traverses `taggedOk`, derived from `tagVols`           |
+| mutating operations (requires `--allow-mutations`)                                                            | `tagVols`, `runbook`                                             |
 
 ### 21.2 What the fixture should exercise in the *implementation*
 
@@ -2701,8 +3197,13 @@ split (§4.2.1) and `token`. It would require `--allow-mutations` to run.
   the warning path.
 - **Waves and nesting** (§4.2): `regions` → {`insts`, `perRegionNet`}; `vols` and `snaps` in parallel with all
   of it; `volSnap` joining after both; inner waves inside `perRegionNet`.
-- **The read/mutate phase split** (§4.2.1): thirteen read-only bindings must all complete before `tagVols` and
-  `runbook` run, and `runbook` is ordered after `tagVols` only because it traverses that binding's outcome —
-  there is no ordering construct to check.
+- **The read/mutate phase split** (§4.2.1): fourteen read-only bindings must all complete before `tagVols` and
+  `runbook` run, and `runbook` is ordered after `tagVols` only because it reads `taggedOk`, which filters that
+  binding's envelope records (`{volId, value}`) for the ones that succeeded — there is no ordering construct to
+  check. Note where the filter sits: on the envelopes, *outside* the traversal. Inside `do` it would filter the
+  automation call's own response instead, which is a mistake this spec made once and the review caught.
 - **Sink defaulting** (§9.1): the nested block omits `result` and must resolve to `joined`; the top level has
   many sinks and must therefore require an explicit `result`.
+
+
+aa807954-7e01-4c2a-830f-8354ee67f244
