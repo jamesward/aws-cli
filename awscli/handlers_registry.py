@@ -675,6 +675,7 @@ PLUGIN_REGISTRY = {
             'register_rename_config',
         ),
         ('awscli.customizations.history', 'register_history_commands'),
+        ('awscli.customizations.codemode', 'register_codemode'),
         ('awscli.customizations.devcommands', 'register_dev_commands'),
         ('awscli.customizations.login', 'register_login_cmds'),
         ('awscli.customizations.update', 'register_update_command'),
@@ -889,6 +890,12 @@ MAIN_COMMAND_TABLE_OPS: list[
         'history',
         'awscli.customizations.history',
         'HistoryCommand',
+    ),
+    (
+        CommandTableOp.ADD,
+        'codemode',
+        'awscli.customizations.codemode.command',
+        'CodeModeCommand',
     ),
     (
         CommandTableOp.ADD,

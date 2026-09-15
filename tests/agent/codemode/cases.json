@@ -1,0 +1,171 @@
+{
+  "_doc": "Agent evaluation cases for `aws codemode`. Each case is a task an agent must turn into ONE validated TOWL program using only the CLI's own help. Checks run on the program the agent prints last (```towl fence) and on the aws codemode commands it issued. No credentials: `run` is forbidden.",
+  "cases": [
+    {
+      "id": "bucket-names",
+      "prompt": "List the names of all my S3 buckets.",
+      "expect_ops_any": [
+        "s3.ListBuckets"
+      ],
+      "expect_substrings": [
+        ".Buckets"
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "=>",
+        "MaxResults",
+        "NextToken",
+        "codemode run",
+        "map@"
+      ],
+      "max_codemode_calls": 6
+    },
+    {
+      "id": "top5-buckets",
+      "prompt": "Summarize the top 5 largest S3 buckets across all regions.",
+      "expect_ops_any": [
+        "cloudwatch.GetMetricStatistics",
+        "cloudwatch.GetMetricData"
+      ],
+      "expect_ops_all": [
+        "s3.ListBuckets"
+      ],
+      "expect_substrings": [
+        "top(5",
+        "now"
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "=>",
+        "ExtendedStatistics: []",
+        "map@"
+      ],
+      "forbid_warnings": [
+        "null.tolerateDefaulted"
+      ],
+      "max_codemode_calls": 10
+    },
+    {
+      "id": "unencrypted-volumes",
+      "prompt": "Across us-east-1, us-west-2 and eu-west-1, which running EC2 instances have at least one unencrypted EBS volume attached? Report instance id, region and the unencrypted volume ids.",
+      "expect_ops_all": [
+        "ec2.DescribeInstances",
+        "ec2.DescribeVolumes"
+      ],
+      "expect_substrings": [
+        "for ",
+        "{ region:",
+        "where("
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "=>",
+        "codemode run",
+        "map@"
+      ],
+      "max_codemode_calls": 10
+    },
+    {
+      "id": "stop-dev-instances",
+      "prompt": "Stop every EC2 instance in us-west-2 that carries the tag Env=dev. Do not execute anything; produce and validate the program only.",
+      "expect_ops_all": [
+        "ec2.DescribeInstances",
+        "ec2.StopInstances"
+      ],
+      "expect_effects": [
+        "mutate"
+      ],
+      "expect_substrings": [
+        "Filters"
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "=>",
+        "codemode run",
+        "map@"
+      ],
+      "max_codemode_calls": 10
+    },
+    {
+      "id": "lambda-runtimes",
+      "prompt": "How many Lambda functions do I have per runtime, across all enabled regions?",
+      "expect_ops_all": [
+        "lambda.ListFunctions"
+      ],
+      "expect_ops_any": [
+        "ec2.DescribeRegions",
+        "account.ListRegions"
+      ],
+      "expect_substrings": [
+        "group(",
+        "count()"
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "=>",
+        "codemode run",
+        "map@"
+      ],
+      "max_codemode_calls": 10
+    },
+    {
+      "id": "iam-key-age",
+      "prompt": "For every IAM user, list each access key with its creation date and when it was last used.",
+      "expect_ops_all": [
+        "iam.ListUsers",
+        "iam.ListAccessKeys",
+        "iam.GetAccessKeyLastUsed"
+      ],
+      "expect_substrings": [
+        "for "
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "=>",
+        "codemode run",
+        "map@"
+      ],
+      "max_codemode_calls": 10
+    },
+    {
+      "id": "bucket-total-size",
+      "prompt": "What is the total size in bytes and the object count of the S3 bucket named example-data-bucket?",
+      "expect_ops_any": [
+        "s3.ListObjectsV2",
+        "s3.ListObjects"
+      ],
+      "expect_substrings": [
+        "sum(",
+        "count()"
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "=>",
+        "ContinuationToken",
+        "MaxKeys",
+        "codemode run",
+        "map@"
+      ],
+      "max_codemode_calls": 8
+    },
+    {
+      "id": "recent-cloudtrail-console-logins",
+      "prompt": "Who signed in to the AWS console in the last 24 hours? Use CloudTrail.",
+      "expect_ops_all": [
+        "cloudtrail.LookupEvents"
+      ],
+      "expect_substrings": [
+        "now",
+        "minus_hours(24)",
+        "ConsoleLogin"
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "=>",
+        "codemode run",
+        "map@"
+      ],
+      "max_codemode_calls": 8
+    }
+  ]
+}
