@@ -3,7 +3,7 @@
 Status: archived v1 draft; retained for saved-plan execution and migration  
 Language version: `v1`
 
-> This document is the frozen TOWL v1 language contract. New language work is in [`TOWL_SPEC.md`](TOWL_SPEC.md) (v2). V1 documents are never interpreted as v2; migration follows the v2 §14.2 contract.
+> This document is the frozen TOWL v1 language contract. Current language work is in [`TOWL_SPEC.md`](TOWL_SPEC.md) (v3); v2 is archived as [`TOWL_V2_SPEC.md`](TOWL_V2_SPEC.md). V1 documents are never interpreted as v2 or v3.
 
 TOWL stands for **Tool Orchestration Workflow Language**. It is a provider-neutral, declarative JSON language for describing a bounded graph of typed tool invocations and pure data transformations. A producer—an AI agent, a human, or another program—authors one document; a user or host may review it; a deterministic processor validates and executes it without requiring another model turn.
 
