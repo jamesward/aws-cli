@@ -14,14 +14,14 @@ Eleven commitments shape everything below. The first nine are about what a progr
 1. **Effects only at operation calls.** The built-in `call("namespace", "operation", args?, options?)` — naming a catalog namespace such as an AWS service or an MCP server and one of its operations, both as string literals — is the only expression with an effect. Everything else is pure and total. The set of effects in a program is a lexical scan for `call(`.
 2. **One binder.** `for x in list` followed by a body is the only construct that binds a name for a computation; it is also the only fan-out. It is not a loop and not a lambda: bodies are independent, there are no function values, and `x` is an alias for the element inside the body. Calls and `for` never appear inside the pure layer — paths, predicates, and call arguments.
 3. **Path-based pure layer.** Element-wise transforms take *paths from the implicit element* and closed predicate expressions, never functions. Aggregation is a fixed set of monoids.
-4. **No silent partial values.** A pageable call returns its complete result; the processor paginates. A limit or an error stops the program, and a failed run returns no result, only a report of what completed. The only way an element leaves a result without an authored filter is absence (item 5), and every such element is reported in the envelope's `losses`.
-5. **Errors are not values; absence is not a type.** A read call that fails because its subject does not exist, or cannot be read here (access denied, not enabled in this region), does not stop the program: the processor classifies the failure (§12.4) and the element it belonged to is dropped and recorded as a loss; every other error stops the program, and a program declares no error handling. Absence — an optional member the provider left out, a read whose subject does not exist, `single()` of nothing — is a runtime fact, not a type: every expression has a plain type, a function of an absent value is absent, and a list never holds an absent value, so an element that would be absent is dropped and recorded as a loss. There is no null value and no default operator; absence can be tested (`present()`, `absent()`) but never replaced, and an absent value that reaches an operation's arguments stops the program (§9.2).
+4. **No silent partial values.** A pageable call returns its complete result; the processor paginates. A run-wide limit or an error that is not absorbed (item 5) stops the program, and a failed run returns no result, only a report of what completed. The only way an element leaves a result without an authored filter is a loss — an absent value, a read that could not be done, or a read over a per-call limit (item 5, §12.3) — and every such element is reported in the envelope's `losses`.
+5. **Errors are not values; absence is not a type.** A read call that fails because its subject does not exist, or cannot be read here (access denied, not enabled in this region), does not stop the program: the processor classifies the failure (§12.4); a subject that does not exist is an absent value, and one that cannot be read drops the element it belonged to, recorded as a loss; every other error stops the program, and a program declares no error handling. Absence — an optional member the provider left out, a read whose subject does not exist, `single()` of nothing — is a runtime fact, not a type: every expression has a plain type, a function of an absent value is absent, and a list never holds an absent value, so an element that would be absent is dropped and recorded as a loss. There is no null value and no default operator; absence can be tested (`present()`, `absent()`) but never replaced, and an absent value that reaches an operation's arguments stops the program (§9.2).
 6. **Order is not observable.** No operation depends on list position; result lists are bags whose serialization order is normalized.
 7. **Ordering is data.** The only dependency between two calls is a reference to a result. There is no sequencing construct and no ordering option; a call that uses another call's result is dispatched after it, independent work is dispatched together, and a host orders independent mutations by policy (§12.1).
 8. **The catalog owns provider facts.** Types, which members are required, defaulted, or optional, pagination, effect class, error classes, context options, and the meaning of a documented absence all come from the catalog (§10). A program cannot restate or override them, and everything a program needs to know about a provider is discoverable from the catalog before writing.
 9. **One meaning per token, and the author is told the cause.** Braces are records; `call` is the effect; `for` is the binder; indentation delimits the only two kinds of block (§3.1). Every diagnostic names the authored decision that caused it and carries a fix (§11). The same skeleton is available as a JSON structure for hosts that pass programs as tool arguments (§3.2).
 10. **Reviewable by a human as written.** A program reads top to bottom as the workflow it performs: one item per line, the name before the thing it names, the result last, every effect visible as `call(` and every fan-out as `for`. Nothing a program does depends on distant or hidden context — there are no defaults for absent values, no implicit ordering, no truncation, and no meaning attached to list position — so a reviewer who has read the lines has read the behavior. The typed review (§11, §13.1) annotates those same lines with inferred types and effects rather than presenting a translation; the reviewer approves the program text.
-11. **Frugal for the author.** The language is small enough to teach in one screen of plain text and to hold in a model's context alongside the task: catalog names in their native spelling, no type annotations except on inputs, no nullability to reason about, no delimiters beyond braces and brackets for data, no boilerplate around calls or bodies, and one form per concept so there is nothing to choose between. A task should cost one capability search, one schema lookup, one program, and one validation; a processor's authoring guide, diagnostics, and catalog rendering are designed toward that count, and the count is measured (Code Mode specification, §8).
+11. **Frugal for the author.** The language is small enough to teach in one screen of plain text and to hold in a model's context alongside the task: catalog names in their native spelling, no type annotations except on inputs, no nullability to reason about, no delimiters beyond braces and brackets for data, no boilerplate around calls or bodies, and one form per concept so there is nothing to choose between. A task should cost one capability search, one schema lookup, one program, and one validation; a processor's authoring guide, diagnostics, and catalog rendering are designed toward that count, and the count is measured (Code Mode specification, §9).
 
 ### 1.1 Non-goals
 
@@ -41,7 +41,7 @@ MUST, MUST NOT, SHOULD, MAY are normative. A **program** is a parsed TOWL v3 sou
 
 ```text
 IDENT     = [A-Za-z_][A-Za-z0-9_]*
-STRING    = JSON string, double or single quoted
+STRING    = JSON string, double or single quoted; a single-quoted string has JSON's escapes plus \'
 NUMBER    = JSON number
 comments  = "//" to end of line | "#" to end of line
 ```
@@ -81,11 +81,12 @@ arg       = path | pred | ref | literal | expr
           ; where, any, all: pred.  concat: expr.  after_last, before_first, minus_*: ref | literal.  present, absent: none.  others: none.
 path      = ("." IDENT)+ ("." (EXPRFN | AGGFN | STRFN | TIMEFN | "present" | "absent") "(" args? ")")*   ; from the implicit element
 ref       = IDENT ("." IDENT)* ("." (STRFN | TIMEFN) "(" (literal | ref)? ")")*   ; enclosing binding or for variable
-pred      = operand cmp operand | operand "in" (list | ref) | pred "&&" pred | pred "||" pred | "!" pred | "(" pred ")"
+pred      = operand cmp operand | operand "in" (plist | ref) | pred "&&" pred | pred "||" pred | "!" pred | "(" pred ")"
           | operand "." ("present" | "absent" | "empty") "(" ")"                                    ; empty: operand : list[T]
           | operand "." ("contains" | "starts_with" | "ends_with") "(" (STRING | ref) ")"
           | operand "." ("any" | "all") "(" pred ")"                                        ; operand : list[T]; inner element is T
 operand   = spath | literal | ref
+plist     = "[" ((literal | ref) ("," (literal | ref))* ","?)? "]"                          ; a pure list
 spath     = ("." IDENT)+ ("." (STRFN | TIMEFN) "(" (literal | ref)? ")")*            ; a path; only string/time continuations (no transforms or aggregations)
 cmp       = "==" | "!=" | "<" | "<=" | ">" | ">="
 type      = "string" | "int" | "number" | "bool" | "timestamp"
@@ -113,7 +114,23 @@ A block is `binding* expr` and ends at its result, so a parser can find every bl
 - A `for` whose body does not begin on the `for` line opens a block: the body's items are the following lines, indented more than the line containing the `for` (canonical: two more spaces); they share one indentation; the block ends at its result. A line indented like the body after the body's result is an error (`syntax.resultNotLast`): the result must be last.
 - A body on the `for` line is a single expression — most often a record — and ends where the expression ends; postfix may continue it. A laid-out body ends the `for` expression except for the dedented continuation below; the usual way to post-process a fan-out is to bind it (`per = for r in regions …` then `per.flatten()`).
 - Layout is suspended inside brackets: a multi-line record, list, or argument list is free-form, and a `for` inside brackets is not layout-checked.
-- A line beginning with `.` continues an expression; which one is decided by its indentation: at or beyond the items of the current block it continues the previous line; indented between a `for` line and its body it applies to the `for` expression as a whole (so `.flatten()` can follow a laid-out body without a binding); a line ending in `=` continues onto the next.
+- A line beginning with `.` continues an expression, chosen by its column:
+  - at or beyond the items of the current block, it continues the expression on the previous line — inside a laid-out body, that is the body's last line;
+  - after a laid-out `for` body, indented more than the `for` line and less than the body, it applies to the `for` expression as a whole;
+  - after a laid-out `for` body, at the column of the `for` line's block, it is an error (`syntax.continuation`): a laid-out body ends its expression. The fix is to indent it between the two columns, or to bind the `for` and continue the name.
+  - A line ending in `=` continues onto the next.
+
+  ```text
+  per = for r in regions          # the block's items are not indented; the body is indented 4 spaces
+      insts = …
+      insts.count()
+    .sum()                        # 2 spaces, between the two → (for …).sum()
+  n = for r in regions [r]
+    .flatten()                    # one-line body: continues the body → [r].flatten()
+  m = for r in regions
+    [r]
+  .flatten()                      # at the block's indentation after a laid-out body → syntax.continuation
+  ```
 - Items may also share a line (`;` or juxtaposition), which is how one-line programs are written; only line-starting items are checked.
 - Tabs are an error; a trailing `:` on a `for` line is accepted and dropped by the canonical rendering.
 
@@ -125,7 +142,7 @@ Hosts that receive programs as tool arguments MAY accept the program as a JSON o
 Program  = { "towl": 3, "description": STRING?, "inputs": { IDENT: type-text }?,
              "bindings": [ Node, ... ]?, "result": expr-text }
 Node     = { "name": IDENT, "value": expr-text }                                       ; any expression
-         | { "name": IDENT, "call": "namespace.operation", "args": Args?,
+         | { "name": IDENT, "call": "namespace.operation", "args": Args?,             ; split at the first "."
              "options": { "region": ..., ... }?, "then": postfix-text? }              ; an operation call
          | { "name": IDENT, "for": { "over": expr-text, "as": IDENT,
                                      "bindings": [ Node, ... ]?, "result": expr-text } }      ; a fan-out
@@ -133,7 +150,7 @@ Args     = JSON object; every value is literal data except an object of exactly 
            which is an expression (a reference such as "ver" or "s.link"); JSON null is not a value (omit the member)
 ```
 
-Rendering: `towl 3 "description"`; one `input name: type` line per input; one `name = value` line per `value` node; `name = call("namespace", "operation"[, <args as a record literal>[, <options as a record literal>]])<then>` per `call` node, where `{"$": e}` renders as `e`; `name = for as in over` followed by the inner nodes and the result on lines indented two spaces, per `for` node; then the result. Because a literal string in `args` is always data, a processor SHOULD warn (`catalog.literalLooksLikeName`) when a string argument equals a name in scope. This form exists because a tool's input schema teaches the skeleton before the model writes anything, and because parameters written as JSON cannot suffer the quote and newline escaping mistakes of a multi-line string.
+The `call` string is split at its first `.`: the namespace is the text before it (namespaces contain no `.`), the operation is everything after it (MCP tool names may contain `.`). Rendering: `towl 3 "description"`; one `input name: type` line per input; one `name = value` line per `value` node; `name = call("namespace", "operation"[, <args as a record literal>[, <options as a record literal>]])<then>` per `call` node, where `{"$": e}` renders as `e`; `name = for as in over` followed by the inner nodes and the result on lines indented two spaces, per `for` node; then the result. Because a literal string in `args` is always data, a processor SHOULD warn (`catalog.literalLooksLikeName`) when a string argument equals a name in scope. This form exists because a tool's input schema teaches the skeleton before the model writes anything, and because parameters written as JSON cannot suffer the quote and newline escaping mistakes of a multi-line string.
 
 ---
 
@@ -156,7 +173,7 @@ Rules:
 - Equality (`==`, `!=`, `distinct`, `group` keys, `in`) is defined on `string int number bool timestamp` and structurally on records and lists of such. Ordering (`< <= > >=`, `min`, `max`) is defined on `int number string timestamp`.
 - Catalog members are **required**, **defaulted** (absence normalized to a declared default, e.g. `[]`), or **optional** (§10). All three have the member's type `T`. Optionality is information for the author — schema renderings write an optional member `Name?: T` so the author can foresee where losses may occur — and has no effect on typing.
 
-**Literals.** A `NUMBER` without fraction or exponent is `int`, otherwise `number`. `true`/`false` are `bool`; a `STRING` is `string`, except in a position whose expected type is `timestamp` (a call parameter or input), where it is `timestamp` if it parses as RFC 3339 and a validation error otherwise. A record literal has the closed record type of its fields. A list literal's elements MUST have one type after the `int → number` join; `[]` and `{}` take their type from the expected type of their position (parameter, input, `concat` argument, `in` operand) and are a validation error `type.emptyLiteral` when no expected type exists. There is no null literal.
+**Literals.** A `NUMBER` without fraction or exponent is `int`, otherwise `number`. `int` is arbitrary-precision (there is no overflow; `sum` of `int` is exact) and `number` is an IEEE 754 double. `true`/`false` are `bool`; a `STRING` is `string`, except in a position whose expected type is `timestamp` (a call parameter, an input, or a comparison or `in` whose other operand is a timestamp), where it is `timestamp` if it parses as RFC 3339 and a validation error otherwise. A record literal has the closed record type of its fields. A list literal's elements MUST have one type after the `int → number` join; `[]` and `{}` take their type from the expected type of their position (parameter, input, `concat` argument, `in` operand) and are a validation error `type.emptyLiteral` when no expected type exists. There is no null literal.
 
 **Lists are bags.** List equality is multiset equality; `concat` is bag union; `collect` and `distinct` are commutative monoids on bags. Serialization order is canonical (§12.5) and never observable to a program. A list never contains an absent value (§9.2).
 
@@ -166,7 +183,7 @@ Rules:
 
 **Header.** `towl 3 "description"`. The description is informative.
 
-**Inputs.** `input name: type` declares a value the host binds before execution. Inputs are how a program receives external data — including the `completed` values of a previous failed run (§13.3) — without embedding literals. Types are checked at preflight; a missing or ill-typed input is a preflight error and no effect occurs. A JSON `null` in a record field of an input value is an absent field (so values a previous envelope reported round-trip); a `null` list element or a `null` input is a preflight error. Two inputs are **predefined** and need no declaration: `now: timestamp` (the run's start instant, UTC) and `today: string` (its `YYYY-MM-DD` date); the processor binds them, so time windows are computed inside the program (§9.4) rather than pasted in as literals. A program MAY still declare or bind a name `now`/`today`, in which case its own definition wins. Other well-known inputs a host offers (Code Mode's `region`) MUST be declared to be bound.
+**Inputs.** `input name: type` declares a value the host binds before execution. Inputs are how a program receives external data — including the `completed` values of a previous failed run (§13.3) — without embedding literals. Types are checked at preflight; a missing or ill-typed input is a preflight error and no effect occurs. A JSON `null` in a record field of an input value is an absent field (so values a previous envelope reported round-trip); a `null` list element or a `null` input is a preflight error. Two inputs are **predefined** and need no declaration: `now: timestamp` (the run's start instant, UTC) and `today: string` (its `YYYY-MM-DD` date); the processor binds them, so time windows are computed inside the program (§9.4) rather than pasted in as literals. A program MAY declare an input or bind a name `now` or `today`; the predefined input of that name is then not in scope, so the program's definition is the only one and the no-shadowing rule below is kept. Other well-known inputs a host offers (Code Mode's `region`) MUST be declared to be bound. A declared input that the program never references is a warning (`names.unusedInput`).
 
 **Bindings.** `name = expr` binds once. Names are unique across the whole scope chain (no shadowing, no rebinding). References to a binding create dependency edges; the binding graph MUST be acyclic (it is, because a binding can only reference earlier bindings and enclosing `for` variables). Namespace names are not reserved: `s3 = call("s3", "ListBuckets").Buckets` is legal, because the namespace in a call is a string, not a name.
 
@@ -190,7 +207,7 @@ call("namespace", "operation", args, options)
 
 ### 6.1 Args
 
-`args` is an expression whose type MUST be assignable to the operation's input shape (§4). Every value in `args` and `options` MUST be present when the call is dispatched: an absent value anywhere in the parameter structure (`Dimensions[0].Value`, a `region` option) stops the program with class `data`, naming the parameter path and where the absence came from (§12.6 origins). Unlike every other consumer of an absent value, a call does not drop its element: an operation invoked without a value the author supplied acts on a different population than the author meant, and dropping the element would turn that into a plausible answer over the wrong set (§16). To call only for elements where a value exists, filter first: `for b in buckets.where(.BucketRegion.present())`. An optional parameter is supplied by writing it and omitted by not writing it; a parameter is never omitted because its value was absent. An empty list literal is never a legal argument value (`catalog.emptyListParameter`): optional parameters are omitted. `args` may reference bindings, enclosing `for` variables, and earlier call results (creating data dependencies). It may not contain operation calls or `for`.
+`args` is an expression whose type MUST be assignable to the operation's input shape (§4). Every value in `args` and `options` MUST be present when the call is dispatched: an absent value anywhere in the parameter structure (`Dimensions[0].Value`, a `region` option) stops the program with class `data`, naming the parameter path and where the absence came from (§12.6 origins). Unlike every other consumer of an absent value, a call does not drop its element: an operation invoked without a value the author supplied acts on a different population than the author meant, and dropping the element would turn that into a plausible answer over the wrong set (§16). To call only for elements where a value exists, filter first: `for b in buckets.where(.BucketRegion.present())`. An optional parameter is supplied by writing it and omitted by not writing it; a parameter is never omitted because its value was absent. An empty list is never a legal argument value: a literal `[]` is a validation error (`catalog.emptyListParameter`; optional parameters are omitted), and a computed empty list anywhere in `args` at dispatch stops the program with class `data` (code `EmptyArgument`), naming the parameter path. Many providers read an empty or omitted list as "no restriction" (`InstanceIds: []` describes every instance), so a list that happened to be empty would silently widen the call; to call only when there is something to pass, filter first or fan out over the list. `args` may reference bindings, enclosing `for` variables, and earlier call results (creating data dependencies). It may not contain operation calls or `for`.
 
 ### 6.2 Options
 
@@ -242,7 +259,7 @@ There is no projection function. One value per element is `collect(.path)` (§9.
 
 The closed predicate sublanguage (§3 `pred`): comparisons between two operands of the same equality/ordering type, `in` against a list, `present()`/`absent()` on any operand, `empty()` on a list-typed path, string tests (a test compared with a boolean literal, `.L.empty() == false`, is the test or its negation), `any(pred)`/`all(pred)` over a list-typed operand (the inner predicate's paths start from the inner element; enclosing `for` variables remain visible as refs), and `&& || !`.
 
-Predicates are three-valued. A comparison, `in`, `empty()`, or string test whose operand is absent is **undecided**; `present()` and `absent()` are always decided. `!` of undecided is undecided; `&&` is false if any term is false, else undecided if any term is undecided; `||` is true if any term is true, else undecided if any term is undecided; `any` and `all` fold their elements the same way. `where` keeps the elements whose predicate is true, drops those that are false, and drops **and records as a loss** those that are undecided (§9.2). Consequently `.Size <= 50` and `!(.Size > 50)` select the same elements, and an element whose `Size` is absent is in neither result and is reported either way. To keep elements whose member is absent, say so: `.Platform.absent() || .Platform != "windows"`.
+Predicates are three-valued. A comparison, `in`, `empty()`, or string test whose operand is absent is **undecided**; `present()` and `absent()` are decided, except on an unknown value (§9.2), where they are undecided too. `!` of undecided is undecided; `&&` is false if any term is false, else undecided if any term is undecided; `||` is true if any term is true, else undecided if any term is undecided; `any` and `all` fold their elements the same way. `where` keeps the elements whose predicate is true, drops those that are false, and drops **and records as a loss** those that are undecided (§9.2). Consequently `.Size <= 50` and `!(.Size > 50)` select the same elements, and an element whose `Size` is absent is in neither result and is reported either way. To keep elements whose member is absent, say so: `.Platform.absent() || .Platform != "windows"`.
 
 Predicates contain no calls or binders, so a host MAY push them down to a provider's server-side filters when it has an exact mapping; the result, including its losses, MUST be identical either way. Because a `for` variable is a legal operand, a predicate inside a `for` body can correlate the element with another list — this is how two independent results are joined (§14, example 6).
 
@@ -293,11 +310,11 @@ A value is **absent** when it is an optional catalog member the provider left ou
 2. **Drop and record.** A list never holds an absent value. Where a list would receive one — a `for` body whose result is absent, a list literal element that is absent — the element is dropped. An element whose aggregator path or `group` key is absent is skipped (§9.1), and a `where` element whose predicate is undecided is dropped (§8.3). An **unknown** value — a read that failed with class `authorization` or `availability` (§12.4), or exceeded a per-call budget (§12.3) — is carried like an absent one, except that a record containing it is itself unknown and `present()`/`absent()` of it are unknown (a failed read says nothing about existence), so it reaches the nearest list and drops its element even when it was only a field. Each drop is a **loss**: it is recorded with the node that dropped it, the origin of the absence, and a sample of the element (§12.6). Nothing is ever dropped silently.
 3. **Stop at an operation.** An absent value anywhere in a call's `args` or `options` stops the program with class `data` (§6.1). An absent program result also stops (class `data`, code `AbsentResult`), since there is no enclosing list to drop it from; to report an absence, return it as a record field.
 
-`present()` and `absent()` are the only observations of absence; they are always decided and never cause a loss, so queries whose answer *is* the absence — buckets without a policy, instances without a public address — are written directly: `per.where(.policy.absent())`.
+`present()` and `absent()` are the only observations of absence; on an absent value they are decided and never cause a loss (on an unknown value they are unknown, since a read that could not be done says nothing about existence), so queries whose answer *is* the absence — buckets without a policy, instances without a public address — are written directly: `per.where(.policy.absent())`.
 
 ```text
 x.m              : U          ; absent if x is absent or its member m is absent
-x.present()      : bool       ; never absent; x.absent() is its negation
+x.present()      : bool       ; decided on an absent x, unknown on an unknown x; x.absent() is its negation
 ```
 
 **There is no default operator** and no null value. Nothing turns an absent value into a present one, because a default is indistinguishable from data once it is in the result (rationale in §16). When a provider documents that absence *means* a value (S3's `LocationConstraint` is absent for `us-east-1`), that meaning belongs to the catalog's typing of the member (§1, item 8), not to the program.
@@ -359,9 +376,9 @@ Operations MAY be model-backed (an LLM `summarize`, a classifier); they are ordi
 
 Validation is total and invokes no operation. It runs these phases and reports **all** diagnostics it can find, each with `line:col`, the source excerpt, the inferred type at that point where relevant, a stable code, and one concrete fix:
 
-1. **syntax** — grammar (§3) and layout (§3.1: `syntax.indent`, `syntax.resultNotLast`, `syntax.tab`), the borrowed forms of §3 with their fixes, the normalizations of §3 (`syntax.nullSafe`, `syntax.nullCompare`, `syntax.nullType`, `syntax.compact`; warnings), and the `pure` restriction on paths, predicates, and args.
-2. **names** — undefined identifiers, shadowing, rebinding, unreferenced bindings, unknown option keys.
-3. **catalog** — unknown namespace/operation (each with nearest names), args not assignable to the input shape, empty-list arguments, authored pagination members, unknown shape names in inputs.
+1. **syntax** — grammar (§3) and layout (§3.1: `syntax.indent`, `syntax.resultNotLast`, `syntax.continuation`, `syntax.tab`), the borrowed forms of §3 with their fixes, the normalizations of §3 (`syntax.nullSafe`, `syntax.nullCompare`, `syntax.nullType`, `syntax.compact`; warnings), and the `pure` restriction on paths, predicates, and args.
+2. **names** — undefined identifiers, shadowing, rebinding, unreferenced bindings, unused inputs (warning).
+3. **catalog** — unknown namespace/operation (each with nearest names), args not assignable to the input shape, unknown option keys (`catalog.unknownOption`), empty-list arguments, authored pagination members, unknown shape names in inputs.
 4. **types** — every expression has exactly one type by the rules of §§4–9; non-equatable comparisons, `flat` on a non-list path, aggregator path types, `single` on a non-list, `for` on a non-list, `in` against a non-list. No type rule concerns absence.
 5. **effects** — the effect table: every call site with its operation, class, and multiplicity (static `n`, or `dynamic ≤ budget`), nested wave depth, and the count of `mutate` sites.
 
@@ -386,15 +403,15 @@ Type inference is syntax-directed with no polymorphism beyond the stdlib signatu
 
 ### 12.1 Evaluation model
 
-The validated program is an SSA graph: nodes are bindings, calls, `for` traversals, and pure transforms; edges are references. Execution is **opportunistic**: a node evaluates as soon as its inputs are values; a call is dispatched as soon as its `args` and `options` dependencies are values; a `for` unrolls into one body instance per element as soon as its source list is a value. Independent nodes proceed concurrently: two bindings that share no dependency are dispatched together, and the first expression that references both is their join point and waits for both (§14, example 6). Because the only effects are calls determined by their arguments, and every call is dispatched exactly once, the final value does not depend on scheduling (confluence). The loss log (§12.6) is a bag, a commutative monoid, so it is confluent too: the same external responses produce the same losses in any schedule. Two `mutate` calls with no data dependency MAY execute in any order or concurrently; hosts MAY impose stricter policy (the Code Mode profile runs them one at a time in source order).
+The validated program is an SSA graph: nodes are bindings, calls, `for` traversals, and pure transforms; edges are references. Execution is **opportunistic**: a node evaluates as soon as its inputs are values; a call is dispatched as soon as its `args` and `options` dependencies are values; a `for` unrolls into one body instance per element as soon as its source list is a value. Independent nodes proceed concurrently: two bindings that share no dependency are dispatched together, and the first expression that references both is their join point and waits for both (§14, example 6). Because the only effects are calls determined by their arguments, and every call is dispatched exactly once (§12.2 limits retries so that a mutation is never applied twice), the final value does not depend on scheduling (confluence). The loss log (§12.6) is a bag, a commutative monoid, so it is confluent too: the same external responses produce the same losses in any schedule. Two `mutate` calls with no data dependency MAY execute in any order or concurrently; hosts MAY impose stricter policy (the Code Mode profile runs them one at a time in source order).
 
 ### 12.2 Pagination and retries
 
-A pageable call is executed to completion by the processor, producing the merged output. Transient failures (throttling, 5xx, timeouts, connection errors) are retried by the processor with backoff and are invisible to the program; retry exhaustion is an error of class `transient`.
+A pageable call is executed to completion by the processor, producing the merged output. Transient failures (throttling, 5xx, timeouts, connection errors) are retried by the processor with backoff and are invisible to the program; retry exhaustion is an error of class `transient`. A `mutate` call is retried only when the retry cannot apply the mutation twice: the failure proves the request was not applied (throttling, a 4xx before processing), or the request carries an idempotency token the catalog declares and the processor fills in. Otherwise — a timeout or connection error after the request may have been received — the call fails with class `mutation` and is reported as possibly applied.
 
 ### 12.3 Admission and limits
 
-Hosts define budgets: maximum wave width, maximum nested wave depth, maximum operation calls, maximum pages per call, maximum result bytes, wall time. Static widths are checked at validation. A dynamic wave is admitted only when its now-known width is within budget; the check happens before any call in the wave is dispatched. Exceeding a budget is an error of class `budget`, with one exception: a **per-call** budget (maximum items or pages of one paged call) exceeded by a read inside a `for` element makes that call's value unknown (§9.2), so the element is dropped and recorded as a loss with reason `budget`, and the loss says which limit to raise to include it. A per-call budget exceeded outside any element, a wave in which every element exceeds it, and every run-wide budget (calls, width, depth, result bytes, wall time) stop the program; so does any budget under a host's strict mode. The result-bytes budget is a backstop against a program returning whole documents into the author's context; its message says to return fewer fields or narrow the list, and successful runs report `result_bytes` so the author sees the cost even when under budget.
+Hosts define budgets: maximum wave width, maximum nested wave depth, maximum operation calls, maximum pages per call, maximum result bytes, wall time. Static widths are checked at validation. A dynamic wave is admitted only when its now-known width is within budget; the check happens before any call in the wave is dispatched. Exceeding a budget is an error of class `budget`, with one exception: a **per-call** budget (maximum items or pages of one paged call) exceeded by a read inside a `for` element makes that call's value unknown (§9.2), so the element is dropped and recorded as a loss with reason `budget`, and the loss says which limit to raise to include it. A per-call budget exceeded outside any element, a wave in which every element exceeds it, and every run-wide budget (calls, width, depth, result bytes, wall time) stop the program; so does any budget under a host's strict mode. Run-wide budgets are checked as the run proceeds, so one can be reached after some mutations have succeeded; they are then listed in `mutations` of the failure envelope (§13.3), and a host that wants no partially applied set of mutations bounds them statically (a static wave width, a host rule against dynamic mutating waves). The result-bytes budget is a backstop against a program returning whole documents into the author's context; its message says to return fewer fields or narrow the list, and successful runs report `result_bytes` so the author sees the cost even when under budget.
 
 ### 12.4 Errors
 
@@ -419,23 +436,23 @@ Error classes and their suggested action:
 | `input` | preflight: missing, undeclared, or ill-typed input | `rewrite` |
 | `transient` | retries exhausted | `rerun` |
 | `validation` | provider rejected parameters | `rewrite` |
-| `authorization` | permission denied (stops only outside a list element, or when a whole wave fails) | `narrow` |
+| `authorization` | permission denied (as a stop: outside any list element, or every element of a wave; a per-call budget overrun stops the same way with class `budget`) | `narrow` |
 | `availability` | opt-in, endpoint, unsupported in region (as `authorization`) | `narrow` |
-| `absence` | provider models "does not exist" as an error (as `authorization`) | `narrow` |
+| `absence` | provider models "does not exist" as an error (as a stop: only under a host's strict mode) | `narrow` |
 | `state` | resource state or race | `rewrite` |
 | `cardinality` | `single()` found more than one | `rewrite` |
-| `data` | an absent value reached a call's arguments or options, or the program result is absent | `rewrite` |
+| `data` | an absent value or an empty list reached a call's arguments or options, or the program result is absent | `rewrite` |
 | `losses` | a `mutate` call was about to be dispatched while losses existed | `losses` |
 | `budget` | a host limit | `budget` |
 | `cancelled` | host or user cancellation | `rerun` |
-| `mutation` | any failure of a `mutate` call, whatever its provider class | `mutation` |
+| `mutation` | any failure of a `mutate` call, whatever its provider class, including one that may have been applied (§12.2) | `mutation` |
 | `other` | anything else | `rewrite` |
 
 The catalog classifies provider codes (§10); the runtime maps a failed `mutate` call to `mutation` regardless and keeps the provider classification in the envelope's provider detail.
 
 ### 12.5 Result normalization
 
-Lists in results are serialized in a canonical order (by canonical JSON of the element) so that two runs with the same external responses produce byte-identical results and no consumer can depend on provider ordering. An absent record field is serialized as `null`; `null` appears nowhere else in a result.
+Lists in results are serialized in a canonical order — by the RFC 8785 (JCS) serialization of each element, after the element's own nested lists have been normalized the same way — so that two runs with the same external responses produce byte-identical results and no consumer can depend on provider ordering. An absent record field is serialized as `null`; `null` appears nowhere else in a result.
 
 ### 12.6 Losses
 
@@ -475,7 +492,7 @@ The origin of an absent value is where it first became absent and is carried unc
 ```text
 { status: "ok", type, value,
   losses:    [ Loss ],                                                   // §12.6; always present, [] when nothing was lost
-  absorbed:  [ { node, element?, operation, code, class } ],               // every failed read that did not stop the run
+  absorbed:  [ { line, element?, operation, code, class } ],               // every failed read that did not stop the run
   effects:   [ { node, operation, class, calls: n, pages: n } ],
   nodes:     [ { node, line, kind: "call" | "where" | "flat" | "for" | ..., in: n?, out: n } ],    // element counts per list-producing node
   accounting: { calls, pages, waves, wall_ms, result_bytes, absorbed, losses } }
@@ -498,7 +515,7 @@ A run that absorbed failures or lost elements is `ok`; every absorbed failure an
     interrupted: [ element ],                          // started, no failure of its own, stopped before its body finished
     not_started: [ element ] } ],
   mutations: [ { node, element?, operation, args, options, response } ],     // every mutate call that succeeded
-  accounting: { calls, pages, waves, wall_ms } }
+  accounting: { calls, pages, waves, wall_ms, losses } }
 ```
 
 Every value in `completed` and `fanout[].completed` is complete (fully paginated, fully evaluated). A value that was mid-evaluation is absent, never partial. For nested waves, `fanout` lists the enclosing waves outermost first; `completed` of an outer wave contains only elements whose whole body finished. An element is `interrupted` when its body had started and the stop prevented a later dispatch in that body; it is neither complete nor failed and belongs in the next program's remaining work together with `not_started`. Hosts bind these sections to `input`s of the next program so that a rewrite can resume without repeating work and without re-issuing completed mutations (§14, example 4). A preflight `input` failure produces this envelope with empty `completed`, `fanout`, and `mutations`.
@@ -507,7 +524,7 @@ Every value in `completed` and `fanout[].completed` is complete (fully paginated
 
 ## 14. Examples
 
-**1. One record per region** (group-preserving fan-out; any error stops the run)
+**1. One record per region** (group-preserving fan-out; a region that cannot be read is a loss, any other error stops the run)
 
 ```text
 towl 3 "Running instances per region"
@@ -529,7 +546,7 @@ towl 3 "Bucket policies"
 buckets = call("s3", "ListBuckets").Buckets
 for b in buckets { bucket: b.Name, policy: call("s3", "GetBucketPolicy", { Bucket: b.Name }).Policy }
 ```
-Type: `list[{ bucket: string, policy: string }]`; `policy` is `null` for a bucket without a policy (`NoSuchBucketPolicy` is class `absence`, so the call is absent, and so is its `.Policy`), and the record is kept; a bucket whose policy cannot be read (`AccessDenied`) is dropped and listed in `losses`, never reported as having no policy. Effects: `s3.ListBuckets read ×1; s3.GetBucketPolicy read × dynamic`. The buckets without a policy are `per.where(.policy.absent())`.
+Type: `list[{ bucket: string, policy: string }]`; `policy` is `null` for a bucket without a policy (`NoSuchBucketPolicy` is class `absence`, so the call is absent, and so is its `.Policy`), and the record is kept; a bucket whose policy cannot be read (`AccessDenied`) is dropped and listed in `losses`, never reported as having no policy. Effects: `s3.ListBuckets read ×1; s3.GetBucketPolicy read × dynamic`. To list only the buckets without a policy, bind the `for` (`per = for b in buckets …`) and return `per.where(.policy.absent()).collect(.bucket)`.
 
 **3. Grouped aggregation**
 
@@ -546,7 +563,7 @@ Type: `list[{ az: string, volumes: int, gib: int }]` (a volume without `Availabi
 ```text
 towl 3 "Running instances per region — resume"
 input done: list[{ region: string, count: int, ids: list[string] }]   // ← fanout[0].completed[].value
-input remaining: list[string]                                          // ← fanout[0].not_started
+input remaining: list[string]                                          // ← fanout[0].failed[].element ∪ interrupted ∪ not_started
 
 more = for r in remaining
   insts = call("ec2", "DescribeInstances", { Filters: [{ Name: "instance-state-name", Values: ["running"] }] }, { region: r })
@@ -558,9 +575,9 @@ done.concat(more)
 **5. Ordered mutations** (the second call takes its arguments from the first's result, which is the only way to order two calls; the reviewer sees the dependency in the typed rendering)
 
 ```text
-towl 3 "Stop then tag"
+towl 3 "Stop, then tag the instances being stopped"
 stopped = call("ec2", "StopInstances", { InstanceIds: ["i-0123"] }).StoppingInstances.collect(.InstanceId)
-tagged  = call("ec2", "CreateTags", { Resources: stopped, Tags: [{ Key: "state", Value: "stopped" }] })
+tagged  = call("ec2", "CreateTags", { Resources: stopped, Tags: [{ Key: "state", Value: "stop-requested" }] })
 { stopped: stopped, tagged: tagged }
 ```
 
@@ -630,14 +647,14 @@ A conforming processor:
 5. reports all diagnostics found in phases 1–4 in one pass, each with location and a fix;
 6. never executes an invalid program and never invokes an operation during validation or preflight;
 7. binds and type-checks every `input`, and binds the predefined inputs `now` and `today` (§5), before the first dispatch;
-8. dispatches each call exactly once, when its dependencies are values;
+8. dispatches each call exactly once, when its dependencies are values, and never retries a mutation that may have been applied (§12.2);
 9. admits dynamic waves against budget before dispatching any call in the wave;
 10. paginates pageable calls to completion and retries transient failures invisibly;
 11. stops on every error except a failed read of class `absence`, `authorization`, or `availability` or a per-call budget overrun, inside a list element that is not the whole wave (§12.3, §12.4), and returns the failure envelope with only complete values;
 12. reports every absorbed failure, every loss (§12.6), and every succeeded mutation; never drops an element except by an authored filter or a recorded loss;
 13. normalizes result list order;
 14. produces identical results and identical losses for identical external responses regardless of scheduling;
-15. stops an absent value at a call's arguments and options (§6.1), and never dispatches a `mutate` call while losses exist unless the host allows losses (§12.4).
+15. stops an absent value or an empty list at a call's arguments and options (§6.1), and never dispatches a `mutate` call while losses exist unless the host allows losses (§12.4).
 
 Required tests: one program per example in §14, including example 7 against a JSON-Schema (MCP-style) catalog and example 8 with a denied read and an absent member; a fixture per failed-read class (absent carried into a field, unknown dropping its element from a field, stop outside any element, stop when a whole wave fails, stop for a failed mutation) and for a per-call budget overrun inside and outside an element; a fixture per diagnostic code; a fixture per error class exercising the failure envelope; a fixture per absence rule of §9.2 (carry into a record field, drop at `for`/list literal, skip at each path aggregator and `group`, undecided `where` including `!` and De Morgan equivalence, absent argument stop, losses before a mutation); a scheduling-permutation test demonstrating invariant 14, including example 6's two independent calls; a fixture showing a `list[list[T]]` diagnostic for `collect(.Instances)` versus `flat(.Instances)`.
 
@@ -656,7 +673,7 @@ Required tests: one program per example in §14, including example 7 against a J
 - **What the first live AWS trial taught** (Python implementation, "summarize the top 5 largest buckets in all regions"). The agent found `cloudwatch.GetMetricStatistics` and wrote the fan-out correctly on the first try, then lost four turns to three gaps that were the language's, not its own: it needed "four days ago" and computed the dates in a shell because there was no way to say it (hence `now` as a well-known input and §9.4); it wrapped numbers in `{ n: x }` to reach `.max(.n)` (hence the scalar-list rule in §9.1); and it ranked the result outside the program because "top 5" was inexpressible (hence `top`/`bottom`, which order by a named key and so keep the bag semantics). A fourth loss came from the parameter relaxation stopping at the top level: `Value: b.Name` inside a `Dimensions` list was a hard type error with no fix. The lesson generalizes: every time the agent has to leave the language to finish the task, the result leaves the effect table with it.
 - **A silent wrong answer is worse than a stop** (second live AWS trial, same task). The program validated, ran, and returned a plausible top-5 — with every bucket in `us-east-1`, because `s3.ListBuckets` leaves `BucketRegion` absent unless the request carries a parameter, and the program had written `b.BucketRegion.or("us-east-1")`. Seven defaults fired, the metric queries went to the wrong region, and the agent reported "all buckets are in us-east-1" as a finding. Nothing in the language had been violated; the envelope simply did not show that the values were manufactured. The first response was to account for defaults in the envelope and warn when a tolerated call was defaulted; the next revision removed the default operator altogether (below). The same run lost a turn to `ExtendedStatistics: []` — the author took a non-nullable optional list for a required one — hence required-parameter marks in the schema rendering and the empty-list-parameter error.
 - **The guide can teach the bug** (agent evaluation with `claude -p`, eight tasks, no credentials). Replaying the top-5-buckets task showed the two bad defaults, `b.Name.or("")` and `b.BucketRegion.or("us-east-1")`, in the agent's *first draft*, before any diagnostic: the guide had said "a member typed `T | Null` must go through `?.` or `.or(...)` before use", and the agent complied. Rewording it — pass nullable members to parameters as they are, keep them nullable in results, default only when the default is the documented meaning of absence — changed the next run's program to `GetBucketLocation(...).LocationConstraint.or("us-east-1")`, which is exactly that case. Two more findings from the same trial: the unpaginated `ListBuckets` request form omits `BucketRegion` (the runner now forces the paginated form), and an undeclared `now` cost a turn until the `names.undefined` fix said to add `input now: timestamp` — and, since it kept costing a turn with the fix in place, `now` and `today` later became predefined (§5). Authoring guidance is part of the language's conformance surface; it should be tested the way the checker is.
-- **Why the binder is `for x in xs`, bodies are laid out, calls are `call("ns", "op", …)`, and `.or` is gone** (third revision of the v3 surface, after the trials above). The `each(x => body)` form borrowed the lambda shape while binding nothing but a name; agents brought lambda habits with it (arrows in other argument positions, function bodies where a path was wanted). A postfix `map@x { … }` fixed that but left braces meaning two things (record or block) and put every binder's name after the thing it named. `for x in xs` puts both names first, has the strongest prior of any shape for "one body per element", and — because a block always ends at its result — lets bodies be delimited by indentation that the processor checks rather than parses, so braces mean records only and the program and every body are the same construct. Method-style calls on a namespace made every service name a reserved word and every misspelled receiver "not a function"; making the namespace and operation string arguments of a built-in `call` turns both into catalog lookups with nearest-name fixes and frees the program's namespace. `.or(d)` was removed rather than accounted for: every one of its uses in the trials was a wrong answer waiting to happen, its correct uses (`LocationConstraint` absent meaning `us-east-1`) are provider facts that belong in the catalog, and once it was gone the two remaining reasons to want it — comparing an optional number and passing an optional value to a required parameter — were better served by making comparisons Null-tolerant and by the argument relaxation that already existed. (Both were later replaced when nullable types were removed; see the last item.)
+- **Why the binder is `for x in xs`, bodies are laid out, calls are `call("ns", "op", …)`, and `.or` is gone** (third revision of the v3 surface, after the trials above). The `each(x => body)` form borrowed the lambda shape while binding nothing but a name; agents brought lambda habits with it (arrows in other argument positions, function bodies where a path was wanted). A postfix `map@x { … }` fixed that but left braces meaning two things (record or block) and put every binder's name after the thing it named. `for x in xs` puts both names first, has the strongest prior of any shape for "one body per element", and — because a block always ends at its result — lets bodies be delimited by indentation that the processor checks rather than parses, so braces mean records only and the program and every body are the same construct. Method-style calls on a namespace made every service name a reserved word and every misspelled receiver "not a function"; making the namespace and operation string arguments of a built-in `call` turns both into catalog lookups with nearest-name fixes and frees the program's namespace. `.or(d)` was removed rather than accounted for: every one of its uses in the trials was a wrong answer waiting to happen, its correct uses (`LocationConstraint` absent meaning `us-east-1`) are provider facts that belong in the catalog, and once it was gone the two remaining reasons to want it — comparing an optional number and passing an optional value to a required parameter — were better served by making comparisons Null-tolerant and by the argument relaxation that already existed. (Both were later replaced when nullable types were removed; see "Why nullability left the type system".)
 - **Why there is no `after`.** Earlier drafts had a call option `after: name` — dispatch only once a binding has resolved, value unused — as the way to order two mutations that share no data. It was removed because an author has no way to know when it is needed (nothing in a task says "and these two must be sequenced"), because every real case of "do B after A" is a data dependency once B's arguments are taken from A's result, which is also the only version a reviewer can check, and because a B that uses nothing of A is asking for an ordering the program cannot express and the host's mutation policy already supplies.
 - **What the eval taught about layout** (eight tasks through `claude -p` after the `for`/layout revision). First drafts were in the new syntax with no layout errors. Two habits needed accommodation: a `.flatten()` line indented *between* a `for` line and its body, meant for the `for`'s result, which the continuation rule now honors (§3.1), and `.L.empty() == false`, a test compared with a boolean, which now parses as the negated test. A third retry cause — declaring `now` — was removed by predefining it.
 - **Exit-and-rewrite with a precise failure envelope** rather than program-level error handling reflects the judgment that an author cannot correctly decide in advance which runtime failures are acceptable, while the processor can classify a failure after it happens and a reviewer can see the resulting losses or an explicitly narrowed resume plan.

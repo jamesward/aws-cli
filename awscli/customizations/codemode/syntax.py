@@ -480,6 +480,12 @@ class Parser:
             while (self.at(".") or self.at("?.")) and self.starts_line() and self.depth[self.p] == 0 \
                     and header is not None and body is not None and header < self.peek().pos.col < body:
                 e = self.postfix(e)
+            if (self.at(".") or self.at("?.")) and self.starts_line() and self.depth[self.p] == 0 \
+                    and header is not None and self.peek().pos.col == header:
+                self.err("syntax.continuation", "a laid-out for body ends its expression, so this line cannot continue it",
+                         self.peek().pos, f"indent it between the for line and the body (column {header + 1}"
+                                          + (f" to {body - 1}" if body - 1 > header + 1 else "") + ") to apply it "
+                                          "to the whole for, or bind the for (per = for ...) and continue the name (per.flatten())")
             return e
         while (self.at(".") or self.at("?.")) and not self.dedented_continuation():
             e = self.postfix(e)

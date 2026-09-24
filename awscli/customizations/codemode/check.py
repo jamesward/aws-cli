@@ -280,14 +280,14 @@ class Checker:
             else:
                 for k, v in e.options.fields:
                     if k == "after":
-                        self.error("syntax", "syntax.options", v.pos, "there is no 'after' option: ordering comes from data",
+                        self.error("catalog", "catalog.unknownOption", v.pos, "there is no 'after' option: ordering comes from data",
                                    "make the second call depend on the first's result (e.g. Resources: stopped.StoppingInstances.collect(.InstanceId)); mutations without a data dependency run one at a time in source order")
                     elif k in ("region", "profile"):
                         t = self.type_of(v, s.as_pure())
                         if t is not T.STRING and t is not T.ERROR:
                             self.error("types", "type.option", v.pos, f"option '{k}' must be a string, got {t}")
                     else:
-                        self.error("syntax", "syntax.options", v.pos, f"unknown call option '{k}'", "options: region, profile")
+                        self.error("catalog", "catalog.unknownOption", v.pos, f"unknown call option '{k}'", "options: region, profile")
         self.effects.append(EffectSite(op, e, 1 if s.depth == 0 else None, s.depth))
         return op.output
 

@@ -207,7 +207,7 @@ class RunCommand(_Base):
     DESCRIPTION = "Type-check, apply policy, and execute a program. Returns the complete result or a failure envelope."
     EXAMPLES = ["aws codemode run --plan file://plan.towl",
                 "aws codemode run --plan file://stop.towl --allow-mutations --yes",
-                "aws codemode run --plan file://resume.towl --input done=@prev.json:'fanout[0].completed[].value' --input remaining=@prev.json:'fanout[0].[interrupted, not_started][]'"]
+                "aws codemode run --plan file://resume.towl --input done=@prev.json:'fanout[0].completed[].value' --input remaining=@prev.json:'fanout[0].[failed[].element, interrupted, not_started][]'"]
     ARG_TABLE = _PLAN_ARGS + [
         {"name": "yes", "action": "store_true", "help_text": "Skip the confirmation prompt; does not bypass gates."},
         {"name": "allow-mutations", "action": "store_true", "help_text": "Authorize mutating or unknown-effect operations."},

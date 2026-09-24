@@ -65,7 +65,7 @@ aws codemode run      --plan <src> [--input ...] [flags]  # revalidate, prefligh
 ```text
 aws codemode run --plan file://resume.towl \
   --input done=@prev.json:'fanout[0].completed[].value' \
-  --input remaining=@prev.json:'fanout[0].[interrupted, not_started][]' 
+  --input remaining=@prev.json:'fanout[0].[failed[].element, interrupted, not_started][]' 
 ```
 
 Inputs are type-checked against the declared type at preflight. Undeclared inputs, missing inputs, and type mismatches are preflight errors; no call is made.
@@ -116,7 +116,7 @@ The catalog is generated from the installed botocore models and the AWS CLI's pa
 
 ### 3.2 Input shapes
 
-The `args` of `call("service", "Operation", args, options)` are checked against the modeled input shape: required members present, all members known, no empty-list values, types assignable (TOWL §4), enums checked against the model's enum set, blobs typed `string` (base64), timestamps typed `timestamp` (a string literal in a timestamp position is typed by TOWL's literal rule). At dispatch every argument and option value must be present (TOWL §6.1): an absent value stops the run with class `data` and code `AbsentArgument`, naming the parameter path and the origin of the absence. The runtime never omits a parameter because its value was absent.
+The `args` of `call("service", "Operation", args, options)` are checked against the modeled input shape: required members present, all members known, no empty-list values, types assignable (TOWL §4), enums checked against the model's enum set, blobs typed `string` (base64), timestamps typed `timestamp` (a string literal in a timestamp position is typed by TOWL's literal rule). At dispatch every argument and option value must be present (TOWL §6.1): an absent value stops the run with class `data` and code `AbsentArgument`, naming the parameter path and the origin of the absence. The runtime never omits a parameter because its value was absent. A computed empty list anywhere in `args` stops the run the same way (`data`/`EmptyArgument`): EC2's `InstanceIds: []` or an empty `Filters` list describes every resource, so an empty list that reaches a call silently widens it.
 
 Members owned by the runtime are **not authorable** and are hidden from `schema`: paginator cursor and page-size members (`NextToken`, `MaxResults`, `Marker`, and service-specific equivalents named by the paginator configuration). Authoring one is a `catalog.runtimeOwned` error naming the rule. Idempotency-token and checksum members remain authorable; when absent botocore populates them.
 
@@ -224,6 +224,9 @@ This rendering — not the raw source — is what the reviewer approves. `valida
 | `syntax.arity` on `xs.max()` | aggregator without a path on a list of records | says which path kind is needed and that the path is optional only for a list of scalars |
 | `type.timestamp` | `.minus_days` on a non-timestamp | says timestamps come from the predefined input `now` or a timestamp member |
 | `catalog.emptyListParameter` | `Param: []` | says AWS rejects it and to omit optional parameters |
+| `data` / `EmptyArgument` (runtime) | a computed empty list in a call's args (`{ InstanceIds: victims }` with nothing in `victims`) | names the parameter path; says to filter first or fan out over the list |
+| `catalog.unknownOption` | an option key the catalog does not declare (`{ retry: 3 }`) | lists the declared options (`region`, `profile`) |
+| `syntax.continuation` | a `.` line at the block's indentation after a laid-out `for` body | gives the column range that applies it to the `for`, or says to bind the `for` and continue the name |
 | `catalog.literalLooksLikeName` (warning) | a string parameter equal to a binding name | shows the reference form; pairs with `names.unreferenced` when the binding is then unused |
 | `budget` / `MaxResultBytes` (runtime) | result over `--max-result-bytes` | says to return fewer fields or narrow the list; `accounting.result_bytes` is reported on success |
 
@@ -238,6 +241,8 @@ TOWL §12.1: dispatch when arguments are values; `for` unrolls when its source i
 ### 5.2 Runtime ownership
 
 The executor owns client creation and caching (by service, region, credential scope), per-endpoint concurrency and adaptive backpressure, botocore retries with jitter, pagination, idempotency-token injection, cancellation, and accounting. Programs cannot set any of these.
+
+Retries follow TOWL §12.2. Reads, and mutations whose input declares an idempotency token (EC2 `ClientToken`, which botocore fills in once per call and reuses across its retries), use botocore's retries. A mutation without a token uses a client with botocore retries off; the executor retries it itself only on throttling codes and on connection failures raised before a request was sent (`EndpointConnectionError`, `ConnectTimeoutError`). Any other failure — a read timeout, a closed connection, a 5xx — is reported at once as class `mutation` with `error.aws.possiblyApplied: true` and a message saying the request may have been applied.
 
 ### 5.3 Budgets
 

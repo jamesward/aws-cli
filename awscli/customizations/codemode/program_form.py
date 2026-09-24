@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 from .syntax import Diagnostic
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_CALL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+_CALL = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\.\S+$")  # namespace, then everything after the first "." (TOWL §3.2)
 
 
 def is_structured(text: str) -> bool:

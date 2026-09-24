@@ -241,10 +241,11 @@ input xs: list[{ n: int | Null }]
 
 def test_options_are_catalog_keys_only():
     codes, diags = errors('towl 3 call("s3", "GetBucketPolicy", { Bucket: "b" }, { tolerate: ["NoSuchBucketPolicy"] }).Policy')
-    assert codes == ["syntax.options"] and "options: region, profile" in diags[0].fix
-    assert errors('towl 3 call("s3", "GetBucketPolicy", { Bucket: "b" }, { retry: 3 })')[0] == ["syntax.options"]
+    assert codes == ["catalog.unknownOption"] and "options: region, profile" in diags[0].fix
+    assert errors('towl 3 call("s3", "GetBucketPolicy", { Bucket: "b" }, { retry: 3 })')[0] == ["catalog.unknownOption"]
+    assert errors('towl 3 call("s3", "GetBucketPolicy", { Bucket: "b" }, "x")')[0] == ["syntax.options"]
     # the structured form renders every option key, so unknown ones are reported there too
-    assert errors('{"towl":3,"bindings":[{"name":"p","call":"s3.GetBucketPolicy","args":{"Bucket":"b"},"options":{"tolerate":["X"]}}],"result":"p.Policy"}')[0] == ["syntax.options"]
+    assert errors('{"towl":3,"bindings":[{"name":"p","call":"s3.GetBucketPolicy","args":{"Bucket":"b"},"options":{"tolerate":["X"]}}],"result":"p.Policy"}')[0] == ["catalog.unknownOption"]
 
 
 def test_all_diagnostics_in_one_pass_with_where_for_structured_form():
@@ -419,7 +420,7 @@ put = call("store", "Put", { key: "k", value: "v" })
     ids = [c[0] for c in calls.calls]
     # reads before mutations; mutations without a data dependency one at a time in source order (no `after` exists)
     assert ids.index("ec2.DescribeInstances") < ids.index("ec2.StopInstances") < ids.index("store.Put")
-    assert errors('towl 3 a = call("ec2", "StopInstances", { InstanceIds: ["i-1"] })  call("store", "Put", { key: "k", value: "v" }, { after: a })')[0] == ["syntax.options", "names.unreferenced"]
+    assert errors('towl 3 a = call("ec2", "StopInstances", { InstanceIds: ["i-1"] })  call("store", "Put", { key: "k", value: "v" }, { after: a })')[0] == ["catalog.unknownOption", "names.unreferenced"]
     assert len(out.get("effects", [])) == 3
     calls = FakeCalls()
     calls.fail = lambda op, p, o: OperationError("IncorrectInstanceState", "busy") if op.id == "ec2.StopInstances" else None
@@ -556,6 +557,48 @@ def test_a_per_call_budget_stops_outside_an_element_for_every_element_and_under_
     calls.fail = over_budget({"beta"})
     strict = Runtime(FakeCatalog(), calls, Limits(), strict=True).execute(service().validate(TOP_OBJECTS), {})
     assert strict["status"] == "error" and strict["error"]["class"] == "budget"
+
+
+def test_a_computed_empty_list_argument_stops():
+    src = """towl 3
+input ids: list[string]
+call("ec2", "StopInstances", { InstanceIds: ids }).StoppingInstances.count()"""
+    out, calls = run(src, inputs={"ids": []})
+    assert (out["error"]["class"], out["error"]["code"]) == ("data", "EmptyArgument") and "InstanceIds" in out["error"]["message"]
+    assert calls.calls == [], "nothing was dispatched"
+    ok, _ = run(src, inputs={"ids": ["i-1"]})
+    assert ok["status"] == "ok" and ok["value"] == 1
+
+
+def test_layout_continuation_after_a_laid_out_for():
+    ns = FakeCatalog.namespaces
+    between = Parser("towl 3\nper = for r in [[1]]\n    r\n  .flatten()\nper", ns).program()
+    assert between.bindings[0].expr.name == "flatten", "between the for line and its body: applies to the for"
+    with pytest.raises(TowlError) as e:
+        Parser("towl 3\nper = for r in [[1]]\n  r\n.flatten()\nper", ns).program()
+    d = e.value.diagnostics[0]
+    assert d.code == "syntax.continuation" and "bind the for" in d.fix and "(column 2)" in d.fix
+
+
+def test_timestamp_literals_compare_with_timestamps_and_dotted_mcp_operations_render():
+    c = service().validate('towl 3 input xs: list[{ t: timestamp }] xs.where(.t > "2026-01-01T00:00:00Z").count()')
+    assert str(c.result_type) == "int"
+    from awscli.customizations.codemode.program_form import render, structural_diagnostics
+    doc = {"towl": 3, "bindings": [{"name": "a", "call": "docs.tools.search", "args": {}}], "result": "a"}
+    assert not [d for d in structural_diagnostics(doc, FakeCatalog.namespaces) if d.severity == "error"]
+    assert 'call("docs", "tools.search")' in render(doc).source
+
+
+def test_canonical_json_is_rfc_8785():
+    from awscli.customizations.codemode.runtime import _canonical
+    assert _canonical({"b": 1.0, "a": [2.5, 3.0, True, None], "c": "é\n"}) == '{"a":[2.5,3,true,null],"b":1,"c":"é\\n"}'
+    # RFC 8785 §3.2.2.3 number examples, and the §3.2.3 key-ordering example (UTF-16 code units: 😀 sorts before U+FB33)
+    for value, text in ((333333333.33333329, "333333333.3333333"), (1e30, "1e+30"), (4.50, "4.5"), (2e-3, "0.002"),
+                        (1e-27, "1e-27"), (1e21, "1e+21"), (1e20, "100000000000000000000"), (1e-7, "1e-7"), (-0.0, "0"),
+                        (0.000001, "0.000001"), (5e-324, "5e-324"), (1.7976931348623157e308, "1.7976931348623157e+308")):
+        assert _canonical(value) == text, value
+    keys = {"\u20ac": 1, "\r": 2, "\ufb33": 3, "1": 4, "\U0001f600": 5, "\u0080": 6, "\u00f6": 7}
+    assert [k for k in __import__("json").loads(_canonical(keys))] == ["\r", "1", "\u0080", "\u00f6", "\u20ac", "\U0001f600", "\ufb33"]
 
 
 def test_an_absent_argument_stops_instead_of_dropping():

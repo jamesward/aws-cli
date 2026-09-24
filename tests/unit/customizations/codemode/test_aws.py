@@ -95,7 +95,7 @@ for i in insts
              "list[{ id: string, volumes: int, gib: int }]"),
     "mutations": ('''towl 3 "Stop then tag"
 stopped = call("ec2", "StopInstances", { InstanceIds: ["i-0123"] })
-tagged  = call("ec2", "CreateTags", { Resources: stopped.StoppingInstances.collect(.InstanceId), Tags: [{ Key: "state", Value: "stopped" }] })
+tagged  = call("ec2", "CreateTags", { Resources: stopped.StoppingInstances.collect(.InstanceId), Tags: [{ Key: "state", Value: "stop-requested" }] })
 { stopped: stopped.StoppingInstances.collect(.InstanceId), tagged: tagged }''', "{ stopped: list[string], tagged: {} }"),
     "top_objects": ('''towl 3 "Top 10 largest S3 objects"
 buckets = call("s3", "ListBuckets").Buckets
@@ -281,6 +281,52 @@ def test_client_adapter_forces_the_paginated_form_of_s3_list_buckets(catalog):
     seen.clear()
     adapter.invoke(catalog.operation("ec2", "DescribeInstances"), {}, {"region": "us-east-1"})
     assert "PageSize" not in seen  # EC2 rejects MaxResults together with identifier filters; never forced
+
+
+def test_mutations_without_an_idempotency_token_are_never_retried_after_they_may_have_applied(catalog):
+    from awscli.botocore.exceptions import ReadTimeoutError
+
+    class Throttled(Exception):
+        response = {"Error": {"Code": "Throttling", "Message": "slow down"}, "ResponseMetadata": {"HTTPStatusCode": 400}}
+
+    calls, configs = [], []
+
+    class Client:
+        def __init__(self, script):
+            self.script = script
+
+        def create_tags(self, **kw):
+            calls.append("create_tags")
+            step = self.script.pop(0)
+            if step is not None:
+                raise step
+            return {"ResponseMetadata": {}}
+
+        run_instances = create_tags
+
+    class Session:
+        def __init__(self, script):
+            self.script = script
+
+        def create_client(self, service, **kw):
+            configs.append(kw.get("config"))
+            return Client(self.script)
+
+    adapter = ClientAwsCalls(Session([Throttled(), Throttled(), None]))
+    adapter.sleep = lambda s: None
+    assert adapter.invoke(catalog.operation("ec2", "CreateTags"), {}, {"region": "us-east-1"}) == {}
+    assert calls == ["create_tags"] * 3, "throttling proves the request was not applied, so it is retried"
+    assert configs[0] is not None and configs[0].retries == {"max_attempts": 1}, "botocore's own retries are off for it"
+    calls.clear()
+    adapter = ClientAwsCalls(Session([ReadTimeoutError(endpoint_url="https://ec2"), None]))
+    adapter.sleep = lambda s: None
+    with pytest.raises(OperationError) as e:
+        adapter.invoke(catalog.operation("ec2", "CreateTags"), {}, {"region": "us-east-1"})
+    assert calls == ["create_tags"] and e.value.aws["possiblyApplied"] is True and "may have been applied" in str(e.value)
+    # an operation with an idempotency token (RunInstances has ClientToken) keeps botocore's retries
+    configs.clear()
+    ClientAwsCalls(Session([None])).invoke(catalog.operation("ec2", "RunInstances"), {}, {"region": "us-east-1"})
+    assert configs == [None]
 
 
 def test_configuration_failures_are_their_own_class(catalog, service):

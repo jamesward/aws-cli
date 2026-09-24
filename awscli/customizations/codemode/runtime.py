@@ -95,11 +95,12 @@ class ClientAwsCalls(AwsCalls):
         self.session = session
         self.profile = profile
         self.max_items = max_items
+        self.sleep = time.sleep
         self._clients = {}
         self._lock = threading.Lock()
 
-    def _client(self, service, region, profile):
-        key = (service, region, profile)
+    def _client(self, service, region, profile, retries=True):
+        key = (service, region, profile, retries)
         with self._lock:
             if key not in self._clients:
                 session = self.session
@@ -107,13 +108,20 @@ class ClientAwsCalls(AwsCalls):
                     from awscli.botocore.session import Session
                     session = Session(profile=profile)
                 kwargs = {"region_name": region} if region else {}
+                if not retries:
+                    from awscli.botocore.config import Config
+                    kwargs["config"] = Config(retries={"max_attempts": 1})
                 self._clients[key] = session.create_client(service, **kwargs)
             return self._clients[key]
 
     def invoke(self, op, params, options):
         from awscli.botocore import xform_name
-        client = self._client(op.namespace, options.get("region"), options.get("profile") or self.profile)
         method = xform_name(op.name)
+        region, profile = options.get("region"), options.get("profile") or self.profile
+        if op.effect != "read" and not _has_idempotency_token(op):
+            # TOWL §12.2: never retry a mutation that may already have been applied
+            return self._invoke_mutation_once(op, self._client(op.namespace, region, profile, retries=False), method, params)
+        client = self._client(op.namespace, region, profile)
         try:
             if op.paged and client.can_paginate(method):
                 paginator = client.get_paginator(method)
@@ -142,6 +150,46 @@ class ClientAwsCalls(AwsCalls):
         if isinstance(result, dict):
             result = {k: v for k, v in result.items() if k != "ResponseMetadata"}
         return _jsonable(result)
+
+    def _invoke_mutation_once(self, op, client, method, params, attempts=5):
+        """A mutation without an idempotency token: retried only on failures that prove it was not applied
+        (throttling, a connection that was never established); anything after the request may have been received
+        is reported as possibly applied."""
+        import random
+        for attempt in range(attempts):
+            try:
+                result = getattr(client, method)(**params)
+                if isinstance(result, dict):
+                    result = {k: v for k, v in result.items() if k != "ResponseMetadata"}
+                return _jsonable(result)
+            except Exception as exc:  # noqa: BLE001
+                response = getattr(exc, "response", None) or {}
+                error = response.get("Error", {}) if isinstance(response, dict) else {}
+                code = error.get("Code") or type(exc).__name__
+                not_applied = code in _THROTTLING_CODES or type(exc).__name__ in _NOT_SENT_ERRORS
+                if not_applied and attempt + 1 < attempts:
+                    self.sleep(min(20.0, 0.2 * 2 ** attempt) * (0.5 + random.random() / 2))
+                    continue
+                status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode") if isinstance(response, dict) else None
+                possibly = not not_applied and not (isinstance(status, int) and 400 <= status < 500)
+                cls = "configuration" if type(exc).__name__ in _CONFIG_ERRORS and not possibly else classify_error(code)
+                message = (error.get("Message") or str(exc)) + ("; the request may have been applied" if possibly else "")
+                raise OperationError(code, message, {
+                    "code": code, "class": cls, "message": message, "possiblyApplied": possibly,
+                    "requestId": (response.get("ResponseMetadata") or {}).get("RequestId") if isinstance(response, dict) else None,
+                    "httpStatus": status,
+                })
+
+
+def _has_idempotency_token(op) -> bool:
+    shape = getattr(op, "input_shape", None)
+    members = getattr(shape, "members", None) or {}
+    return any((getattr(m, "metadata", None) or {}).get("idempotencyToken") for m in members.values())
+
+
+_THROTTLING_CODES = {"Throttling", "ThrottlingException", "ThrottledException", "RequestLimitExceeded", "TooManyRequestsException",
+                     "RequestThrottled", "RequestThrottledException", "SlowDown", "ProvisionedThroughputExceededException"}
+_NOT_SENT_ERRORS = {"EndpointConnectionError", "ConnectTimeoutError"}  # no connection, so no request was received
 
 
 _CONFIG_ERRORS = {
@@ -444,6 +492,12 @@ class Runtime:
                 run.fail(Stop("data", "AbsentArgument",
                               f"{where} '{path}' of {op.id} is absent at runtime: {describe_origin(o)}; an absent value is never passed to an operation{hint}",
                               op, e.pos, env.element, env.in_each))
+        empty = _find_empty(args)
+        if empty:
+            run.fail(Stop("data", "EmptyArgument",
+                          f"parameter '{empty}' of {op.id} is an empty list at runtime; an empty list is never passed to an operation, because "
+                          "providers often read it as 'no restriction'. Filter first so the call runs only when there is something to pass, "
+                          "or fan out over the list", op, e.pos, env.element, env.in_each))
         mutate = op.effect != "read"
         if mutate and run.losses and not run.allow_losses:
             n = run.loss_count()
@@ -819,6 +873,23 @@ def _find_absent(v, path=""):
     return None
 
 
+def _find_empty(v, path=""):
+    """First path of an empty list inside a call's args (TOWL §6.1)."""
+    if isinstance(v, list):
+        if not v:
+            return path or "<value>"
+        for i, x in enumerate(v):
+            got = _find_empty(x, f"{path}[{i}]")
+            if got:
+                return got
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            got = _find_empty(x, f"{path}.{k}" if path else k)
+            if got:
+                return got
+    return None
+
+
 def _plain(v):
     """JSON value: absent record fields become null (TOWL §12.5)."""
     if is_absent(v):
@@ -958,7 +1029,49 @@ def _ord_key(v):
 
 
 def _canonical(v) -> str:
-    return json.dumps(v, sort_keys=True, separators=(",", ":"), default=lambda o: None if is_absent(o) else str(o))
+    """RFC 8785 (JCS) serialization (TOWL §12.5): object keys sorted by UTF-16 code units, no whitespace, strings as
+    JSON.stringify writes them, numbers in the ECMAScript Number-to-String form. Absent values serialize as null."""
+    if v is None or is_absent(v):
+        return "null"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return _es_number(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, (list, tuple)):
+        return "[" + ",".join(_canonical(x) for x in v) + "]"
+    if isinstance(v, dict):
+        keys = sorted(v, key=lambda k: str(k).encode("utf-16-be"))
+        return "{" + ",".join(json.dumps(str(k), ensure_ascii=False) + ":" + _canonical(v[k]) for k in keys) + "}"
+    return json.dumps(str(v), ensure_ascii=False)
+
+
+def _es_number(x: float) -> str:
+    """ECMAScript Number::toString for a finite double (RFC 8785 §3.2.2.3), from Python's shortest round-trip repr."""
+    import decimal
+    import math
+    if not math.isfinite(x):
+        return "null"  # not representable in JSON; never produced from provider data
+    if x == 0:
+        return "0"
+    sign, digits, exp = decimal.Decimal(repr(x)).normalize().as_tuple()
+    d = "".join(map(str, digits))
+    k, n = len(d), len(d) + exp  # k significant digits; the decimal point sits after n of them
+    if k <= n <= 21:
+        out = d + "0" * (n - k)
+    elif 0 < n <= 21:
+        out = d[:n] + "." + d[n:]
+    elif -6 < n <= 0:
+        out = "0." + "0" * (-n) + d
+    else:
+        e = n - 1
+        out = (d if k == 1 else d[0] + "." + d[1:]) + "e" + ("+" if e >= 0 else "-") + str(abs(e))
+    return ("-" if sign else "") + out
 
 
 def _normalize_order(v):
