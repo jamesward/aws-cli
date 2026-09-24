@@ -3,7 +3,7 @@
 Status: draft / request for comment  
 Code Mode profile version: `3`  
 Language dependency: [`TOWL v3`](TOWL_SPEC.md)  
-Implementation status: `awscli/customizations/codemode/` implements this specification (TOWL v3). The archived [v1 profile](CODE_MODE_V1-SPEC.md) describes the earlier JSON-plan prototype, which has been removed; v1 plans are rejected with a pointer here.
+Implementation status: `awscli/customizations/codemode/` implements this specification (TOWL v3).
 
 Code Mode lets an agent (or a person) describe a bounded AWS workflow as one small TOWL program, see a typed review of exactly which operations it will call, and execute it deterministically without a model in the loop. TOWL owns the language, types, and execution model. This document owns everything AWS-specific: the catalog derived from botocore, the CLI surface, policy, budgets, error classification, result rendering, help, and the implementation plan.
 
@@ -22,7 +22,7 @@ An agent using ordinary CLI tool calls performs one operation per model turn, re
 - One-shot authoring from API knowledge: the program for a typical task fits in ten lines.
 - Nothing runs before a typed review that lists every operation, its effect class, and its multiplicity.
 - Validation diagnostics precise enough that a second attempt is right: location, inferred type, one fix.
-- No partial data ever reaches the agent as a result; failures return a report that lets the next program resume without repeating work.
+- No silent partial data: every element a successful result lost to an absent value is listed in `losses`; failures return a report that lets the next program resume without repeating work.
 - Read-only by default; mutations are explicit, gated, and reported.
 - Statelessness: every command receives a complete source and stores nothing.
 
@@ -94,11 +94,11 @@ The same processor is exposed as an MCP server so that an agent's entire tool be
 |---|---|---|
 | `codemode_plan_helper` | `queries: list[string]` (one per *capability*: verb + object), `limit?`, `include_guide?` (default true; false on a repeat search) | the TOWL v3 authoring guide (§7.1) plus the matching operations with typed input/merged-output schemas, effect class, error codes; `unmatched`: the queries no operation satisfies, with a note that the catalog is fully listed and searching again finds nothing; a bounded sample of other operation names |
 | `codemode_validate` | `program: ProgramForm`, `inputs?: object` | the validation report and typed rendering (§4.2); never throws |
-| `codemode_run` | `program: ProgramForm`, `inputs?: object`, `allow_mutations?: bool` | the success or failure envelope; policy rejections are returned as envelopes, never thrown |
+| `codemode_run` | `program: ProgramForm`, `inputs?: object`, `allow_mutations?: bool`, `allow_losses?: bool` | the success or failure envelope; policy rejections are returned as envelopes, never thrown |
 
 `ProgramForm` is the structured program form of TOWL §3.2 — bindings as `{ name, value }`, `{ name, call, args?, options?, then? }` with `call` a `"service.Operation"` string and `args` a real JSON object (`{"$": "expr"}` for references), or `{ name, for: { over, as, bindings, result } }` — so the tool's input schema teaches the skeleton and AWS parameter payloads are JSON, not JSON inside a string. The CLI accepts the text form; both render to the same program.
 
-The tool descriptions MUST carry this guidance: call the helper **once** with all capability queries; search by what an operation *does*, never by the task's subject (library, bucket, instance names are arguments, not operations); a capability the helper reports as `unmatched` does not exist — never search for it again, design without it; pass the program as the structured form, never as one escaped multi-line string; when a result is empty, read `nodes` (per-node element counts) before changing the program. Diagnostics carry `where` (the binding or result they belong to) in addition to line and column.
+The tool descriptions MUST carry this guidance: call the helper **once** with all capability queries; search by what an operation *does*, never by the task's subject (library, bucket, instance names are arguments, not operations); a capability the helper reports as `unmatched` does not exist — never search for it again, design without it; pass the program as the structured form, never as one escaped multi-line string; when a result is empty, read `nodes` (per-node element counts) before changing the program; when `losses` is non-empty, report it with the result. Diagnostics carry `where` (the binding or result they belong to) in addition to line and column.
 
 Two requirements on the helper: it MUST report unmatched queries explicitly, and every piece of authoring guidance — the guide, per-operation notes, examples — MUST be generated from the installed catalog and MUST NOT name an operation, namespace, or capability the catalog lacks. Advice that depends on a capability (for example "pass long text to a summarizing operation") is emitted only when such an operation exists and names it; otherwise the guidance says the capability is absent and what to do instead. (The failure loops behind both are in Appendix A.)
 
@@ -116,23 +116,23 @@ The catalog is generated from the installed botocore models and the AWS CLI's pa
 
 ### 3.2 Input shapes
 
-The `args` of `call("service", "Operation", args, options)` are checked against the modeled input shape: required members present, all members known, no empty-list values, types assignable (TOWL §4, including the nullable-to-required relaxation with its runtime `data` check), enums checked against the model's enum set, blobs typed `string` (base64), timestamps typed `timestamp` (a string literal in a timestamp position is typed by TOWL's literal rule).
+The `args` of `call("service", "Operation", args, options)` are checked against the modeled input shape: required members present, all members known, no empty-list values, types assignable (TOWL §4), enums checked against the model's enum set, blobs typed `string` (base64), timestamps typed `timestamp` (a string literal in a timestamp position is typed by TOWL's literal rule). At dispatch every argument and option value must be present (TOWL §6.1): an absent value stops the run with class `data` and code `AbsentArgument`, naming the parameter path and the origin of the absence. The runtime never omits a parameter because its value was absent.
 
 Members owned by the runtime are **not authorable** and are hidden from `schema`: paginator cursor and page-size members (`NextToken`, `MaxResults`, `Marker`, and service-specific equivalents named by the paginator configuration). Authoring one is a `catalog.runtimeOwned` error naming the rule. Idempotency-token and checksum members remain authorable; when absent botocore populates them.
 
 ### 3.3 Output shapes and member optionality
 
-botocore models almost every response member as optional. Applying TOWL's optional rule literally would make every path nullable, so the AWS profile classifies members:
+botocore models almost every response member as optional. TOWL types never depend on optionality (TOWL §4, §9.2), so the profile's classification decides only which members are normalized and which may be absent at runtime:
 
 | Modeled member | TOWL typing | Rationale |
 |---|---|---|
-| list-typed | **defaulted** `list[T]`, default `[]` | absence and emptiness are indistinguishable to callers; enables `.Reservations.flat(.Instances)` |
-| map-typed | **defaulted** `list[{ key: K, value: V }]`, default `[]` | TOWL has no map type; lookup is `.where(.key == "Name").single()?.value` |
-| documented absence | catalog-typed | where a provider documents that an absent member *means* a value (S3 `LocationConstraint` absent = `us-east-1`), the catalog SHOULD normalize it to that value and type the member non-nullable; programs have no default operator (TOWL §9.2) |
-| structure, scalar, blob, timestamp | **optional** `T \| Null` unless `required` in the model | genuine absence |
-| enum | **optional** `string \| Null` with the enum documented | |
+| list-typed | **defaulted** `list[T]`, default `[]` | absence and emptiness are indistinguishable to callers; enables `.Reservations.flat(.Instances)` without a loss |
+| map-typed | **defaulted** `list[{ key: K, value: V }]`, default `[]` | TOWL has no map type; lookup is `.where(.key == "Name").single().value` |
+| documented absence | catalog-typed | where a provider documents that an absent member *means* a value (S3 `LocationConstraint` absent = `us-east-1`), the catalog SHOULD normalize it to that value so it is never absent; programs have no default operator (TOWL §9.2) |
+| structure, scalar, blob, timestamp | **optional** `T` unless `required` in the model | genuine absence; may cause a loss where consumed |
+| enum | **optional** `string` with the enum documented | |
 
-`schema` prints the effective typing, so the author sees `Reservations: list[Reservation]` and `Platform: string | Null`.
+`schema` prints the effective typing and marks optional members, so the author sees `Reservations: list[Reservation]` and `Platform?: string` and can foresee which filters and keys may record losses. The mark is informational; nothing in a program changes because of it.
 
 ### 3.4 Pagination
 
@@ -158,11 +158,11 @@ The classes and actions are TOWL §12.4's; Code Mode supplies the AWS code mappi
 | `state` | `IncorrectInstanceState`, `DependencyViolation`, `ResourceInUseException`, `ConditionalCheckFailedException` |
 | `other` | anything else |
 
-The classifier is deterministic: exact code table first, then the `NotFound`/`NoSuch` substring rule, then `other`. Substring rather than suffix matching matters because authors copy codes from operation documentation, where spellings such as `NotFoundError` appear; a code the classifier does not recognize cannot be tolerated. A failed `mutate` call is reported as TOWL class `mutation` with the AWS classification in `error.aws.class`. `openErrorCodes` is true for every AWS operation because service error models are incomplete: a `tolerate` code not modeled for the operation is accepted with a warning when the classifier places it in `absence`, `authorization`, `availability`, or `state`, and is a validation error otherwise.
+The classifier is deterministic: exact code table first, then the `NotFound`/`NoSuch` substring rule, then `other`. Substring rather than suffix matching matters because services spell the same condition differently (`NotFoundError`, `NoSuchKey`, `InvalidInstanceID.NotFound`). The class decides what a failed read does (TOWL §12.4): `absence` makes the value absent, `authorization` and `availability` drop the element, everything else stops; a code the classifier does not recognize is `other` and stops, so a missing mapping is loud. Service error models are incomplete, so classification never depends on whether the operation models the code. A failed `mutate` call is reported as TOWL class `mutation` with the AWS classification in `error.aws.class`.
 
 ### 3.7 Options
 
-Core: `tolerate` (TOWL §6.2). AWS profile options:
+AWS profile options (TOWL §6.2):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -208,9 +208,9 @@ This rendering — not the raw source — is what the reviewer approves. `valida
 
 | Code | Trigger | Message shape |
 |---|---|---|
-| `type.nestedList` | `project(.Instances)` where a flat list is later required, or `collect` over a list-typed path | shows `list[list[T]]`, suggests `flat(.Instances)` or `flatten()` |
-| `type.nullableAccess` | `.m` on `T \| Null` | names `?.m`; the result stays nullable |
-| `syntax.removed` / `syntax.forForm` / `syntax.lambda` / `syntax.callForm` | forms borrowed from other languages (TOWL §3): `.or(...)`, `xs.map(...)`, `xs.each(...)`, `x => ...`, `for (x in xs)`, `service.Op(...)` | one fix each: keep the value nullable; `for x in xs` with its body forms; `call("service", "Op", { ... })` |
+| `type.nestedList` | `collect(.Instances)` or a `for` whose body is a list, where a flat list is later required | shows `list[list[T]]`, suggests `flat(.Instances)` or `flatten()` |
+| `syntax.notInTowl` / `syntax.forForm` / `syntax.lambda` / `syntax.callForm` | forms borrowed from other languages (TOWL §3): `.or(...)`, `null` as a value, `xs.map(...)`, `xs.each(...)`, `x => ...`, `for (x in xs)`, `service.Op(...)` | one fix each: nothing replaces `.or` — absent values drop their element and are reported; omit the parameter or test `.x.absent()`; `for x in xs` with its body forms; `call("service", "Op", { ... })` |
+| `syntax.nullSafe` / `syntax.nullCompare` / `syntax.nullType` / `syntax.compact` (warnings) | null-handling habits from other languages: `?.`, `x == null`, `T \| Null`, `.compact()` | says the form is read as `.` / `.absent()` / `T` / nothing, and that no null handling is needed |
 | `syntax.indent` / `syntax.resultNotLast` / `syntax.tab` / `syntax.brace` | layout that disagrees with structure (TOWL §3.1); a binding after a body's result; a tab; `{ a = ... }` | names the block and columns; says the result must be last; says braces enclose records and bindings go on their own lines |
 | `catalog.runtimeOwned` | authored `NextToken`/`MaxResults` | explains pagination is automatic |
 | `catalog.unknownMember` | misspelled or CLI-spelled member | lists the nearest API-spelled members |
@@ -219,12 +219,13 @@ This rendering — not the raw source — is what the reviewer approves. `valida
 | `for.staticWidthExceeded` | literal source longer than `--max-width` | shows width and budget |
 | `catalog.unknownNamespace` | `call("x", ...)` where `x` is not a service (in either program form) | names the nearest services; never reported as "op is not a function" |
 | `type.notRecord` | `.Member` on a bare scalar result | names the operation that returned the scalar and says to drop `.Member` |
-| `type.nullableToRequired` (warning) | `T \| Null` supplied where the operation requires `T`, at any depth (`Dimensions: [{ Value: b.Name }]`) | shows both types one level deep; a runtime Null is a `data` error naming the path (`Dimensions[0].Value`) |
+| `data` / `AbsentArgument` (runtime) | an absent value in a call's args or options (`{ region: b.BucketRegion }` for a bucket without one) | names the parameter path, the origin (member and line, or failed call and code), and the filter `.where(.BucketRegion.present())` |
+| `losses` / `LossesBeforeMutation` (runtime) | a `mutate` call about to be dispatched while losses exist | lists the losses; says to handle them in the program (`present()`/`absent()` filters) or rerun with `--allow-losses` after the user agrees |
 | `syntax.arity` on `xs.max()` | aggregator without a path on a list of records | says which path kind is needed and that the path is optional only for a list of scalars |
 | `type.timestamp` | `.minus_days` on a non-timestamp | says timestamps come from the predefined input `now` or a timestamp member |
 | `catalog.emptyListParameter` | `Param: []` | says AWS rejects it and to omit optional parameters |
 | `catalog.literalLooksLikeName` (warning) | a string parameter equal to a binding name | shows the reference form; pairs with `names.unreferenced` when the binding is then unused |
-| `budget` / `MaxResultBytes` (runtime) | result over `--max-result-bytes` | says to project fewer fields or narrow the list; `accounting.result_bytes` is reported on success |
+| `budget` / `MaxResultBytes` (runtime) | result over `--max-result-bytes` | says to return fewer fields or narrow the list; `accounting.result_bytes` is reported on success |
 
 ---
 
@@ -232,7 +233,7 @@ This rendering — not the raw source — is what the reviewer approves. `valida
 
 ### 5.1 Scheduling
 
-TOWL §12.1: dispatch when arguments are values; `for` unrolls when its source is a value; independent work overlaps. Code Mode adds one policy barrier: **all `read` calls that do not depend on a mutation complete before the first `mutate` call is dispatched**, and `mutate` calls without a data dependency between them execute one at a time (in source order at the top level; in admission order inside a wave) — this is the ordering a program gets for "stop, then tag" when it does not thread the first result into the second call. Read-after-mutate happens only through a data dependency and carries a report note that visibility is eventually consistent. The barrier is applied at binding granularity: a binding containing any mutation waits for every mutation-independent binding.
+TOWL §12.1: dispatch when arguments are values; `for` unrolls when its source is a value; independent work overlaps. Code Mode adds one policy barrier: **all `read` calls that do not depend on a mutation complete before the first `mutate` call is dispatched**, and `mutate` calls without a data dependency between them execute one at a time (in source order at the top level; in admission order inside a wave) — this is the ordering a program gets for "stop, then tag" when it does not thread the first result into the second call. Read-after-mutate happens only through a data dependency and carries a report note that visibility is eventually consistent. The barrier is applied at binding granularity: a binding containing any mutation waits for every mutation-independent binding. The barrier is also where TOWL's loss rule (TOWL §12.4) is checked: because every mutation-independent read has completed, the loss log then holds every loss the mutation's inputs could have suffered, and a `mutate` call is dispatched only if the log is empty or `--allow-losses` was given.
 
 ### 5.2 Runtime ownership
 
@@ -245,18 +246,21 @@ The executor owns client creation and caching (by service, region, credential sc
 | operation calls (physical requests) | 500 | `--max-calls` | stop, class `budget` |
 | wave width (elements per `for` with calls) | 200 | `--max-width` | static: validation error; dynamic: stop before dispatch |
 | nested wave depth | 2 | (fixed) | validation error |
-| items per paged call | 100 000 | `--max-items` | stop, class `budget` (botocore paginators merge pages; the item cap is the enforceable bound) |
+| items per paged call | 100 000 | `--max-items` | inside a `for` element: the element is a loss with reason `budget` and a hint to raise `--max-items`; otherwise, or for every element of a wave, or under `--strict`: stop, class `budget` (botocore paginators merge pages; the item cap is the enforceable bound) |
 | concurrency | 8 | `--max-concurrency` | n/a |
 | result bytes | 1 MiB | `--max-result-bytes` | stop, class `budget` |
 | wall time | 300 s | `--timeout` | stop, class `budget` |
 
-A budget stop produces the failure envelope; there is no truncated success.
+A budget stop produces the failure envelope; there is no truncated success. A per-call item overrun inside a fan-out is not truncation: the element is absent from the result and named in `losses` (TOWL §12.3).
 
 ### 5.4 Gates and approval
 
 - Read-only by default; any `mutate` call site requires `--allow-mutations`.
+- A `mutate` call is not dispatched while losses exist (TOWL §12.4, §5.1) unless `--allow-losses` is given; the stop is class `losses` and the envelope lists them. `--allow-losses` is a statement that the user accepts acting on incomplete data; an agent passes it only after showing the losses to the user.
 - `profile` option requires `--allow-profile-override`.
-- Interactive `run` shows the typed rendering and effect table and asks for confirmation when the program mutates, when any wave is dynamic, when the static call estimate exceeds `--approval-call-threshold` (default 50), or when more than one literal region is used. Non-interactive runs without `--yes` stop with `status: policy_rejected` (exit 252) and make no calls. `--yes` skips only the prompt.
+- `--strict` makes every error stop, including failed reads that would otherwise be absorbed as losses (TOWL §12.4); use it when the answer must cover everything or nothing.
+- Interactive `run` shows the typed rendering and effect table and asks for confirmation when the program mutates or when the static call estimate exceeds `--approval-call-threshold` (default 50). Non-interactive runs without `--yes` stop with `status: policy_rejected` (exit 252) and make no calls. `--yes` skips only the prompt.
+- A read-only program within the static threshold runs without confirmation, including one with dynamic fan-out or several regions. Its reach is bounded at runtime by the budgets of §5.3 (width, calls, items, result bytes, wall time), which stop it before any excess call is dispatched, and it changes nothing.
 
 ### 5.5 Errors and the failure envelope
 
@@ -271,15 +275,16 @@ The `action` field is the agent's cue:
 | `rerun` | transient exhaustion; the same program is fine |
 | `configure` | credentials, profile, region, or endpoint configuration; the same program is fine once the CLI is configured |
 | `rewrite` | the program is wrong (input, provider validation, state, cardinality, data, other) |
-| `tolerate-candidate` | narrow the scope (drop the region/resource) or declare `tolerate` at that call, using `fanout[].failed` |
+| `narrow` | a read failed with `absence`, `authorization`, or `availability` where it could not be absorbed (outside any list element, or for every element of a wave): drop that region/resource from the program, or fix permissions with the user |
 | `budget` | narrow the scope or raise the flag with the user |
 | `mutation` | some mutations succeeded; bind `mutations` as an input and exclude them |
+| `losses` | no mutation ran because earlier steps lost elements; read `losses`, then filter explicitly in the program or rerun with `--allow-losses` once the user accepts them |
 
 ---
 
 ## 6. Result rendering
 
-Success and failure envelopes are TOWL §13.2 and TOWL §13.3 JSON on stdout; the approval prompt and the typed rendering shown before it go to stderr. `validate` prints the typed rendering as text by default and the JSON report with `--output json`; `run` always prints the JSON envelope (the `--output table` question is open, §10). Lists are in canonical order (TOWL §12.5).
+Success and failure envelopes are TOWL §13.2 and TOWL §13.3 JSON on stdout; the approval prompt and the typed rendering shown before it go to stderr. `validate` prints the typed rendering as text by default and the JSON report with `--output json`; `run` always prints the JSON envelope (the `--output table` question is open, §10). Lists are in canonical order (TOWL §12.5). The success envelope always carries `losses` (empty when nothing was lost) immediately after `value`, and `accounting.losses`; an agent that reports a result reports its losses with it.
 
 ---
 
@@ -287,7 +292,7 @@ Success and failure envelopes are TOWL §13.2 and TOWL §13.3 JSON on stdout; th
 
 ### 7.1 `aws codemode help`
 
-Plain text, renderer-free, generated from the installed catalog so it cannot drift from the executor — and so it never names an operation or capability the catalog lacks (§2.4). Sections: purpose; the five-step agent workflow; program shape and layout (TOWL §3.1); values, `call`, members, `for`; the list functions, aggregators, string and time functions with types; the type vocabulary and the Null rules; authoring rules; three worked examples (fan-out per region, tolerated absence, two independent calls joined by a `for`); the success and failure envelopes with the error-action table. Text form only — the structured form (TOWL §3.2) is for tool arguments (§2.4) and is not taught by the CLI. Target length: what a model needs in-context to author correctly in one turn — under 90 lines; the eval in §8 measures the outcome.
+Plain text, renderer-free, generated from the installed catalog so it cannot drift from the executor — and so it never names an operation or capability the catalog lacks (§2.4). Sections: purpose; the five-step agent workflow; program shape and layout (TOWL §3.1); values, `call`, members, `for`; the list functions, aggregators, string and time functions with types; the type vocabulary and the three absence rules (carry, drop and record, stop at an operation; TOWL §9.2) with `present()`/`absent()`; authoring rules; the failed-read rule (absence is a null field; denied or unavailable drops the element; a whole failed wave stops); four worked examples (fan-out per region, a missing policy kept as a null field, a fan-out whose denied buckets become losses, two independent calls joined by a `for`); the success and failure envelopes with `losses` and the error-action table. Text form only — the structured form (TOWL §3.2) is for tool arguments (§2.4) and is not taught by the CLI. Target length: what a model needs in-context to author correctly in one turn — under 90 lines; the eval in §8 measures the outcome.
 
 ### 7.2 `operation search`
 
@@ -295,7 +300,7 @@ Ranked over service, operation, and documentation text, with read verbs (`list`/
 
 ### 7.3 `schema`
 
-Exact, lossless, concise: input members with types, a `required:` line naming the parameters that must be present (the others are omitted, never passed as `[]` or `null`), runtime-owned members listed separately, the (merged) output shape in TOWL type syntax, effect class, paging, modeled error codes, and referenced shapes. Shared shapes are printed once and referenced by name, and a shape name is itself a valid identifier (`aws codemode schema cloudwatch.Dimension`) because authors look up what they see in a type. An operation whose result is a bare scalar (`string`, `json`) is rendered as "`string` (a bare value, not a record)" with a note that the call's value is the result and there is no wrapper member: models generalize the `{ result: … }` shape of neighbouring operations to one that lacks it, and the note prevents that.
+Exact, lossless, concise: input members with types, a `required:` line naming the parameters that must be present (the others are omitted, never passed as `[]`), runtime-owned members listed separately, the (merged) output shape in TOWL type syntax with optional members marked `Name?: T`, effect class, paging, modeled error codes, and referenced shapes. Shared shapes are printed once and referenced by name, and a shape name is itself a valid identifier (`aws codemode schema cloudwatch.Dimension`) because authors look up what they see in a type. An operation whose result is a bare scalar (`string`, `json`) is rendered as "`string` (a bare value, not a record)" with a note that the call's value is the result and there is no wrapper member: models generalize the `{ result: … }` shape of neighbouring operations to one that lacks it, and the note prevents that.
 
 ---
 
@@ -312,11 +317,11 @@ Modules under `awscli/customizations/codemode/`:
 | `check.py` | names, catalog, types, effects, static widths; all diagnostics in one pass |
 | `program_form.py` | the structured JSON form: structural checks, rendering to text with `where` mapping |
 | `service.py` | the stateless pipeline for both program forms |
-| `runtime.py` | dependency scheduling with the read-before-mutate barrier, waves and admission, `tolerate`, stop semantics, envelopes; `ClientAwsCalls` (botocore paginators, error mapping) |
+| `runtime.py` | dependency scheduling with the read-before-mutate barrier and the loss gate, waves and admission, failed-read classification (absent/unknown/stop, whole-wave stop), absence (carry/drop/stop) and the loss log, stop semantics, envelopes; `ClientAwsCalls` (botocore paginators, error mapping) |
 | `render.py` | typed rendering and validation report |
 | `schema.py` | capability search and exact schemas in TOWL type syntax |
 | `source.py` | `--plan` and `--input` resolution |
-| `tests/agent/codemode/eval.py` | agent evaluation: runs `cases.json` tasks through `claude -p` with a shim `aws` on PATH, no credentials; checks that the agent's final program validates, uses the expected operations/effects/text, avoids forbidden text (`.or(`, `=>`, runtime-owned members, `codemode run`) and stays within a call budget |
+| `tests/agent/codemode/eval.py` | agent evaluation: runs `cases.json` tasks through `claude -p` with a shim `aws` on PATH, no credentials; checks that the agent's final program validates, uses the expected operations/effects/text, avoids forbidden text (`.or(`, `?.`, `=>`, runtime-owned members, `codemode run`) and stays within a call budget |
 | `command.py` | CLI commands, policy gates, approval, generated help |
 
 Dependency graph and waves are derived from the AST (`free_refs`, checker `waves`); there is no separate lowering artifact. Predicate pushdown (§3.8) is not implemented yet; every predicate is evaluated client-side, which is always correct.
@@ -327,9 +332,9 @@ Dependency graph and waves are derived from the AST (`free_refs`, checker `waves
 
 Present (`tests/unit/customizations/codemode/`):
 
-- **Language** (`test_core.py`, fake catalog): parsing incl. layout diagnostics, every stdlib function, Null rules, predicates, aggregators, time functions, the structured form, waves and budgets, scheduling permutations (TOWL invariant 14), the barrier and mutation serialization, tolerate, the failure envelope's `completed`/`fanout` sections, inputs and resume.
-- **AWS profile** (`test_aws.py`, real botocore models, fake transport): member typing policy (§3.3), merged paged shapes, error-code classification and the `mutation` override, the paginated `ListBuckets` form, required-parameter and shape rendering in `schema`, search ranking, CLI commands (gates, exit codes, `--input` binding), the six worked examples' typed results.
-- **Agent evaluation** (`tests/agent/codemode/eval.py`): eight tasks through `claude -p` (§8); pass means the agent's final program validates with the expected operations within a call budget.
+- **Language** (`test_core.py`, fake catalog): parsing incl. layout diagnostics and the null-handling normalizations, every stdlib function, the absence rules (carry into fields, drops and skips with their loss records and origins, three-valued `where`, the absent-argument stop, the loss gate before mutations), predicates, aggregators, time functions, the structured form, waves and budgets, scheduling permutations (TOWL invariant 14, including losses), the barrier and mutation serialization, failed-read classification (absent field, unknown drop, stop outside an element, whole-wave stop, strict mode), the failure envelope's `completed`/`fanout` sections, inputs and resume.
+- **AWS profile** (`test_aws.py`, real botocore models, fake transport): member typing policy (§3.3) and optional marks, merged paged shapes, error-code classification and the `mutation` override, the paginated `ListBuckets` form, required-parameter and shape rendering in `schema`, search ranking, CLI commands (gates incl. `--allow-losses`, exit codes, `--input` binding), the worked examples' typed results, and TOWL example 8 (top S3 objects with a denied bucket) against a fake transport.
+- **Agent evaluation** (`tests/agent/codemode/eval.py`): nine tasks through `claude -p` (§8), including the top-10-objects task of Appendix A; pass means the agent's final program validates with the expected operations within a call budget and uses no null-handling forms.
 
 Planned: effect classification against a reviewed golden set; recorded-response fixtures per error class; an opt-in integration run against a real account (examples 1–3 read-only; example 5 under `--allow-mutations`).
 
@@ -337,25 +342,26 @@ Planned: effect classification against a reviewed golden set; recorded-response 
 
 ## 10. Decisions and open items
 
-- Decisions taken in this profile: pagination is invisible and complete; no partial success; exit on all errors except declared `tolerate` codes; `tolerate` limited to non-transient, non-validation classes; list/map members defaulted, others optional; read-before-mutate barrier; mutations serialized unless dependent; no journal — resume via inputs bound from the failure envelope; `now`/`today` predefined, `region` bound when declared; v1 JSON plans rejected with a pointer here (Appendix A).
-- Open: whether `--output table` should support nested records via flattening; whether `account_id` as a well-known input should require confirmation as a read call; the reviewed golden set for effect classification; catalog normalization of documented absences (§3.3) is specified but not implemented; non-paginated operations that still take a cursor parameter return one page and should be marked or paged.
+- Decisions taken in this profile: pagination is invisible and complete; no silent partial success (absence drops are listed in `losses`); no author-declared error handling: failed reads of class absence/authorization/availability inside a list element are absorbed as losses, every other error stops, and so does a wave in which every element is denied or unavailable (`--strict` makes every error stop); absent arguments stop; no mutation while losses exist without `--allow-losses`; list/map members defaulted, others optional (informational only); read-before-mutate barrier; mutations serialized unless dependent; no journal — resume via inputs bound from the failure envelope; `now`/`today` predefined, `region` bound when declared; v1 JSON plans rejected with a pointer here (Appendix A).
+- Open: whether `--output table` should support nested records via flattening; whether `account_id` as a well-known input should require confirmation as a read call; the reviewed golden set for effect classification; catalog normalization of documented absences (§3.3) is specified but not implemented (until it is, `GetBucketLocation(...).LocationConstraint` is absent for `us-east-1` buckets and stops a call that uses it as `region`); non-paginated operations that still take a cursor parameter return one page and should be marked or paged; catalog-declared identifier members (`InstanceId`, `Name`) to make loss samples shorter than "the element's scalar members".
 
 ---
 
 ## 11. Conformance fixture
 
-The AWS programs in TOWL §14 (examples 1–6; example 7 is an MCP-catalog fixture and belongs to the Kotlin implementation) constitute the Code Mode fixture set, with these AWS-profile expectations:
+The AWS programs in TOWL §14 (examples 1–6 and 8; example 7 is an MCP-catalog fixture and belongs to the Kotlin implementation) constitute the Code Mode fixture set, with these AWS-profile expectations:
 
 | Example | Expected effect table | Expected type |
 |---|---|---|
-| 1 | `ec2.DescribeInstances read paged ×3` | `list[{ region: string, count: int, ids: list[string] }]` (`InstanceId` is optional; `collect` skips `Null`) |
-| 2 | `s3.ListBuckets read paged ×1; s3.GetBucketPolicy read ×dynamic(≤200) tolerate NoSuchBucketPolicy`; one nullable-to-required warning on `Bucket` | `list[{ bucket: string \| Null, policy: string \| Null }]` |
-| 3 | `ec2.DescribeVolumes read paged ×1` | `list[{ az: string \| Null, volumes: int, gib: int }]` |
+| 1 | `ec2.DescribeInstances read paged ×3` | `list[{ region: string, count: int, ids: list[string] }]` (`InstanceId` is optional; `collect` skips an absent one and records a loss) |
+| 2 | `s3.ListBuckets read paged ×1; s3.GetBucketPolicy read ×dynamic(≤200)`; no warnings | `list[{ bucket: string, policy: string }]` (`policy` is `null` for `NoSuchBucketPolicy`; a denied bucket is a loss) |
+| 3 | `ec2.DescribeVolumes read paged ×1` | `list[{ az: string, volumes: int, gib: int }]` |
 | 4 | `ec2.DescribeInstances read paged ×dynamic(≤200)`; two inputs required | as 1 |
 | 5 | `ec2.StopInstances mutate ×1; ec2.CreateTags mutate ×1` — the second depends on the first's result; requires `--allow-mutations` | `{ stopped: list[string], tagged: {} }` |
-| 6 | `ec2.DescribeInstances read paged ×1; ec2.DescribeVolumes read paged ×1` — one wave of two independent calls; `for` is pure fan-in | `list[{ id: string \| Null, volumes: int, gib: int }]` |
+| 6 | `ec2.DescribeInstances read paged ×1; ec2.DescribeVolumes read paged ×1` — one wave of two independent calls; `for` is pure fan-in | `list[{ id: string, volumes: int, gib: int }]` |
+| 8 | `s3.ListBuckets read paged ×1; s3.ListObjectsV2 read paged ×dynamic(≤200)` | `list[{ rank: int, value: { bucket: string, key: string, size: int } }]`; a denied bucket is one `for` loss with an `error` origin of class `authorization` |
 
-The typed results above are asserted by `test_aws.py` against the installed botocore models; examples 2, 5, and 6 also run against a fake transport.
+The typed results above are asserted by `test_aws.py` against the installed botocore models; examples 2, 5, 6, and 8 also run against a fake transport.
 
 ---
 
@@ -369,3 +375,5 @@ The typed results above are asserted by `test_aws.py` against the installed boto
 - **Subcommand help** originally fell through to the CLI's man-page renderer, which fails without `groff`; the codemode commands now print plain text.
 - **Options and API members.** Three Glue operations model a member literally named `Region`; keeping options in a separate record from `args` avoided an aliasing rule.
 - **The agent evaluation** (`tests/agent/codemode/eval.py`) was introduced when transcripts showed the guide itself teaching a bug (`.or("")` on names): guidance is part of the conformance surface and is tested like the checker. After the `for`/layout revision, seven of eight tasks validated on the first attempt; the remaining retry causes (a dedented `.flatten()` after a laid-out body, `.empty() == false`, an undeclared `now`) each became a language or guide change.
+- **The top-10-objects trial** (`large-s3.txt`) spent about eight validate cycles on one tolerated `ListObjectsV2` inside a fan-out: the nullable list it produced could not be projected, iterated, filtered to non-null, or flattened, and the agent dropped `tolerate` to get a program that type-checked. It is the reason TOWL removed nullable types in favor of runtime absence with losses, and then `tolerate` itself, since the agent's attempts to guess codes (`PermanentRedirect`, `AccessDenied`) were half the retries (TOWL §9.2, §12.4, §16); the agent's first draft, minus its `tolerate`, is TOWL example 8. The same run hit `--max-items` on a CloudTrail bucket and the agent excluded the bucket by name on its own initiative and reported it, which the guide endorses for reads (tell the user what was excluded and offer to include it). The next trial (`no-null.txt`) wrote a correct program on the first attempt and lost only one run, to the same bucket; per-call item overruns inside a fan-out became losses with reason `budget`, which is that exclusion done by the runtime, in one run, with the limit to raise named in the loss.
+- **Approval for reads.** Confirmation used to be required for dynamic waves and for programs using more than one literal region as well. Nearly every useful read program triggered one of them (all transcripts above needed `--yes` for a read-only fan-out), so `--yes` had become boilerplate that agents added without review, which is worse than no prompt. Read-only programs within the static threshold now run without confirmation; the runtime budgets bound their reach (§5.4).

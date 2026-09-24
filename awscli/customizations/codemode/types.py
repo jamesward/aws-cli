@@ -1,10 +1,11 @@
-"""TOWL v3 types (TOWL_SPEC.md §4): one collection type, closed records, the single union ``T | Null``,
-and an opaque ``json`` for values the catalog could not type."""
+"""TOWL v3 types (TOWL_SPEC.md §4): one collection type, closed records, and an opaque ``json`` for values the
+catalog could not type. There is no null type: absence is a runtime fact (§9.2), never part of a type. A record
+may carry an informational ``optional`` set (members the provider may leave out), printed as ``Name?: T``."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, FrozenSet
 
 
 class Type:
@@ -28,7 +29,6 @@ INT = _Scalar("int")
 NUMBER = _Scalar("number")
 BOOL = _Scalar("bool")
 TIMESTAMP = _Scalar("timestamp")
-NULL = _Scalar("Null")
 JSON = _Scalar("json")
 ERROR = _Scalar("?")  # poison type produced by a diagnostic; assignable anywhere, so one error does not cascade
 
@@ -44,27 +44,40 @@ class TList(Type):
 
 
 class TRecord(Type):
-    """Closed record. ``fields`` may be computed lazily (recursive provider shapes)."""
+    """Closed record. ``fields`` may be computed lazily (recursive provider shapes); the thunk returns either the
+    fields or ``(fields, optional)``. ``optional`` never affects typing; it is shown to authors."""
 
-    __slots__ = ("_fields", "_thunk", "name")
+    __slots__ = ("_fields", "_optional", "_thunk", "name")
 
-    def __init__(self, fields=None, name=None, thunk=None):
+    def __init__(self, fields=None, name=None, thunk=None, optional=()):
         self._fields = dict(fields) if fields is not None else None
+        self._optional = frozenset(optional)
         self._thunk = thunk
         self.name = name
+
+    def _force(self):
+        got = self._thunk()
+        if isinstance(got, tuple):
+            self._fields, self._optional = dict(got[0]), frozenset(got[1])
+        else:
+            self._fields = dict(got)
 
     @property
     def fields(self) -> Dict[str, Type]:
         if self._fields is None:
-            self._fields = dict(self._thunk())
+            self._force()
         return self._fields
+
+    @property
+    def optional(self) -> FrozenSet[str]:
+        if self._fields is None:
+            self._force()
+        return self._optional
 
     def __str__(self):
         if self.name:
             return self.name
-        if not self.fields:
-            return "{}"
-        return "{ " + ", ".join(f"{k}: {v}" for k, v in self.fields.items()) + " }"
+        return _fields_text(self, lambda v: str(v))
 
     __repr__ = __str__
 
@@ -79,26 +92,11 @@ class TRecord(Type):
         return hash(self.name) if self.name else hash(tuple(sorted(self.fields)))
 
 
-@dataclass(frozen=True)
-class TNullable(Type):
-    inner: Type
-
-    def __str__(self):
-        return f"{self.inner} | Null"
-
-    __repr__ = __str__
-
-
-def nullable(t: Type) -> Type:
-    return t if isinstance(t, TNullable) or t is NULL else TNullable(t)
-
-
-def strip_null(t: Type) -> Type:
-    return t.inner if isinstance(t, TNullable) else t
-
-
-def is_nullable(t: Type) -> bool:
-    return isinstance(t, TNullable) or t is NULL
+def _fields_text(rec: TRecord, show) -> str:
+    if not rec.fields:
+        return "{}"
+    opt = rec.optional
+    return "{ " + ", ".join(f"{k}{'?' if k in opt else ''}: {show(v)}" for k, v in rec.fields.items()) + " }"
 
 
 def is_scalar(t: Type) -> bool:
@@ -116,8 +114,6 @@ def is_ordered(t: Type) -> bool:
 def is_equatable(t: Type, _seen=None) -> bool:
     if t is JSON:
         return False
-    if isinstance(t, TNullable):
-        return is_equatable(t.inner, _seen)
     if isinstance(t, TList):
         return is_equatable(t.element, _seen)
     if isinstance(t, TRecord):
@@ -128,70 +124,35 @@ def is_equatable(t: Type, _seen=None) -> bool:
     return True
 
 
-def assignable(src: Type, dst: Type, _depth=0, relaxed=False) -> bool:
-    """``src`` may be used where ``dst`` is expected. The only coercion is int -> number.
-
-    ``relaxed`` is TOWL §6.1's parameter rule: a ``T | Null`` value may be supplied where ``T`` is required,
-    at any depth, with a runtime ``data`` check (see ``null_at_required``)."""
+def assignable(src: Type, dst: Type, _depth=0) -> bool:
+    """``src`` may be used where ``dst`` is expected. The only coercion is int -> number. A record literal may
+    omit members the destination marks optional (or list-typed); it may not add unknown members."""
     if src == dst or src is ERROR or dst is ERROR or dst is JSON:
         return True
     if src is INT and dst is NUMBER:
         return True
-    if isinstance(dst, TNullable):
-        return src is NULL or assignable(strip_null(src), dst.inner, _depth, relaxed)
-    if isinstance(src, TNullable):
-        return relaxed and assignable(src.inner, dst, _depth, relaxed)
     if isinstance(src, TList) and isinstance(dst, TList):
-        return assignable(src.element, dst.element, _depth, relaxed)
+        return assignable(src.element, dst.element, _depth)
     if isinstance(src, TRecord) and isinstance(dst, TRecord):
         if _depth > 6:
             return True
         return all(
-            (k in src.fields and assignable(src.fields[k], t, _depth + 1, relaxed)) or (k not in src.fields and (is_nullable(t) or isinstance(t, TList)))
+            (k in src.fields and assignable(src.fields[k], t, _depth + 1)) or (k not in src.fields and (k in dst.optional or isinstance(t, TList)))
             for k, t in dst.fields.items()
         ) and all(k in dst.fields for k in src.fields)
     return False
 
 
-def null_at_required(value: Any, t: Type, path: str = "") -> Optional[str]:
-    """First path where a Null sits in a non-nullable position of ``t`` (the runtime side of the relaxation)."""
-    if value is None:
-        return None if is_nullable(t) or t in (JSON, ERROR) or isinstance(t, TList) else (path or "<value>")
-    if isinstance(t, TNullable):
-        return null_at_required(value, t.inner, path)
-    if isinstance(t, TList) and isinstance(value, list):
-        for i, v in enumerate(value):
-            p = null_at_required(v, t.element, f"{path}[{i}]")
-            if p:
-                return p
-    if isinstance(t, TRecord) and isinstance(value, dict):
-        for k, v in value.items():
-            ft = t.fields.get(k)
-            if ft is None:
-                continue
-            p = null_at_required(v, ft, f"{path}.{k}" if path else k)
-            if p:
-                return p
-    return None
-
-
-def join(a: Type, b: Type) -> Optional[Type]:
-    """Join for list literals and branches: equal, or int/number, or Null-lifting."""
+def join(a: Type, b: Type):
+    """Join for list literals: equal, or int/number, element-wise for lists and records."""
     if a == b:
         return a
     if a is ERROR:
         return b
     if b is ERROR:
         return a
-    if a is NULL:
-        return nullable(b)
-    if b is NULL:
-        return nullable(a)
     if is_numeric(a) and is_numeric(b):
         return NUMBER
-    if isinstance(a, TNullable) or isinstance(b, TNullable):
-        j = join(strip_null(a), strip_null(b))
-        return nullable(j) if j is not None else None
     if isinstance(a, TList) and isinstance(b, TList):
         j = join(a.element, b.element)
         return TList(j) if j is not None else None
@@ -207,13 +168,12 @@ def join(a: Type, b: Type) -> Optional[Type]:
 
 
 def conforms(value: Any, t: Type) -> bool:
-    """Best-effort runtime check that a host-supplied input matches its declared type."""
+    """Runtime check that a host-supplied input matches its declared type. A ``null`` (or missing) record field is
+    an absent field (TOWL §5); a ``null`` anywhere else does not conform."""
     if t in (JSON, ERROR):
         return True
-    if t is NULL:
-        return value is None
-    if isinstance(t, TNullable):
-        return value is None or conforms(value, t.inner)
+    if value is None:
+        return False
     if t in (STRING, TIMESTAMP):
         return isinstance(value, str)
     if t is INT:
@@ -225,18 +185,17 @@ def conforms(value: Any, t: Type) -> bool:
     if isinstance(t, TList):
         return isinstance(value, list) and all(conforms(v, t.element) for v in value)
     if isinstance(t, TRecord):
-        return isinstance(value, dict) and all(conforms(value.get(k), ft) for k, ft in t.fields.items()) and all(k in t.fields for k in value)
+        return isinstance(value, dict) and all(k in t.fields for k in value) and all(
+            value.get(k) is None or conforms(value[k], ft) for k, ft in t.fields.items())
     return False
 
 
 def normalize(value: Any, t: Type, _depth=0) -> Any:
-    """Normalize a decoded provider value against its type: absent list members become ``[]``."""
+    """Normalize a decoded provider value against its type: absent list members become ``[]`` (defaulted)."""
     if value is None:
         return [] if isinstance(t, TList) else None
-    if isinstance(t, TNullable):
-        return normalize(value, t.inner, _depth)
     if isinstance(t, TList) and isinstance(value, list):
-        return [normalize(v, t.element, _depth + 1) for v in value]
+        return [normalize(v, t.element, _depth + 1) for v in value if v is not None]
     if isinstance(t, TRecord) and isinstance(value, dict) and _depth < 32:
         out = {}
         for k, v in value.items():
@@ -257,15 +216,12 @@ def parse_type(text: str, shape_lookup=None) -> Type:
 
 
 def describe(t: Type, depth: int = 1) -> str:
-    """Type text with records expanded to ``depth`` levels; deeper named records print by name."""
-    if isinstance(t, TNullable):
-        return f"{describe(t.inner, depth)} | Null"
+    """Type text with records expanded to ``depth`` levels (optional members marked ``?``); deeper named records
+    print by name."""
     if isinstance(t, TList):
         return f"list[{describe(t.element, depth)}]"
     if isinstance(t, TRecord):
         if depth <= 0 and t.name:
             return t.name
-        if not t.fields:
-            return "{}"
-        return "{ " + ", ".join(f"{k}: {describe(v, depth - 1)}" for k, v in t.fields.items()) + " }"
+        return _fields_text(t, lambda v: describe(v, depth - 1))
     return str(t)

@@ -8,9 +8,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from . import types as T
-from .aws_catalog import ABSENCE, AUTHORIZATION, AVAILABILITY, STATE, TRANSIENT, VALIDATION
 from .syntax import (
-    KEYWORDS, STR_FNS, TEST_FNS, TIME_FNS, AndP, Binding, BlockE, Cmp, Diagnostic,
+    KEYWORDS, STR_FNS, TEST_FNS, TIME_FNS, BOOL_FNS, AndP, Binding, BlockE, Cmp, Diagnostic,
     ExprArg, Implicit, InP, LambdaArg, ListE, Lit, Member, MethodCall, NotP, OpCall, OrP, Pred, PredArg, Program,
     QuantP, RecordE, Ref, TestP, TowlError,
 )
@@ -20,14 +19,12 @@ from .syntax import (
 class EffectSite:
     op: object
     call: OpCall
-    tolerate: List[str]
     static_width: Optional[int]  # None when dynamic
     depth: int
 
     def to_dict(self):
         return {
             "line": self.call.pos.line, "operation": self.op.id, "effect": self.op.effect,
-            "tolerate": list(self.tolerate),
             "multiplicity": self.static_width if self.static_width is not None else "dynamic", "depth": self.depth,
         }
 
@@ -91,6 +88,7 @@ class Checker:
 
     def check(self, program: Program, source: str) -> Checked:
         binding_types = {}
+        self.diags.extend(getattr(program, "warnings", ()))
         scope = _Scope({}, None, False, 0)
         # predefined inputs (TOWL §5): usable without a declaration; a declaration or binding of the same name wins
         self.declared = {i.name for i in program.inputs} | {b.name for b in program.bindings}
@@ -152,8 +150,6 @@ class Checker:
     def _compute(self, e, s, expected):
         if isinstance(e, Lit):
             v = e.value
-            if v is None:
-                return T.NULL
             if isinstance(v, bool):
                 return T.BOOL
             if isinstance(v, int):
@@ -161,7 +157,7 @@ class Checker:
             if isinstance(v, float):
                 return T.NUMBER
             if isinstance(v, str):
-                return T.TIMESTAMP if expected is not None and T.strip_null(expected) is T.TIMESTAMP else T.STRING
+                return T.TIMESTAMP if expected is T.TIMESTAMP else T.STRING
             return T.JSON
         if isinstance(e, Ref):
             self.referenced.add(e.name)
@@ -178,11 +174,10 @@ class Checker:
             if s.implicit is not None:
                 return s.implicit
             return self.error("syntax", "syntax.pathOutsideElement", e.pos,
-                              "a path starting with '.' refers to the element of a list function (project, where, flat, ...) and is not valid here",
+                              "a path starting with '.' refers to the element of a list function (collect, where, flat, ...) and is not valid here",
                               "name the value instead, e.g. x.Field, or move this into a list function")
         if isinstance(e, RecordE):
-            exp = T.strip_null(expected) if expected is not None else None
-            exp = exp if isinstance(exp, T.TRecord) else None
+            exp = expected if isinstance(expected, T.TRecord) else None
             if not e.fields and exp is None and expected is not T.JSON:
                 self.error("types", "type.emptyLiteral", e.pos, "'{}' has no type here; only call parameters may be an empty record")
             fields = {}
@@ -192,8 +187,7 @@ class Checker:
                 fields[k] = self.type_of(v, s, exp.fields.get(k) if exp else None)
             return T.TRecord(fields)
         if isinstance(e, ListE):
-            exp_elem = T.strip_null(expected) if expected is not None else None
-            exp_elem = exp_elem.element if isinstance(exp_elem, T.TList) else None
+            exp_elem = expected.element if isinstance(expected, T.TList) else None
             if not e.items:
                 if exp_elem is not None:
                     return T.TList(exp_elem)
@@ -209,7 +203,7 @@ class Checker:
             return T.TList(t)
         if isinstance(e, BlockE):
             if s.pure:
-                self.error("syntax", "syntax.pureLayer", e.pos, "a block is not allowed inside a path, shape, predicate, or call parameters")
+                self.error("syntax", "syntax.pureLayer", e.pos, "a block is not allowed inside a path, predicate, or call parameters")
             inner = s
             seen = set(s.bindings)
             for b in e.bindings:
@@ -237,11 +231,10 @@ class Checker:
         target = self.type_of(e.target, s)
         if target is T.ERROR:
             return T.ERROR
-        if T.strip_null(target) is T.JSON:
+        if target is T.JSON:
             return self.error("types", "type.opaque", e.pos, f"'.{e.name}' on an opaque json value (its operation declares no schema for it)",
                               "use the value whole, or pass it to an operation that accepts json")
-        nullable = T.is_nullable(target)
-        rec = T.strip_null(target)
+        rec = target
         if not isinstance(rec, T.TRecord):
             src = e.target
             if isinstance(src, OpCall):
@@ -255,18 +248,13 @@ class Checker:
         if ft is None:
             return self.error("catalog", "catalog.unknownMember", e.pos, f"'{e.name}' is not a member of {rec}",
                               "members: " + ", ".join(sorted(rec.fields)))
-        if nullable and not e.null_safe:
-            return self.error("types", "type.nullableAccess", e.pos, f"'.{e.name}' on a nullable value ({target})",
-                              f"use '?.{e.name}' to propagate Null; the result stays nullable", target)
-        if not nullable and e.null_safe:
-            self.warn("types", "type.needlessNullSafe", e.pos, f"'?.{e.name}' on a non-nullable value; '.{e.name}' is canonical")
-        return T.nullable(ft) if nullable else ft
+        return ft
 
     # ── calls ────────────────────────────────────────────────────────────────
 
     def _op_call(self, e: OpCall, s):
         if s.pure:
-            self.error("syntax", "syntax.pureLayer", e.pos, "an operation call is not allowed inside a path, shape, predicate, or another call's parameters",
+            self.error("syntax", "syntax.pureLayer", e.pos, "an operation call is not allowed inside a path, predicate, or another call's parameters",
                        f'bind it first: name = call("{e.namespace}", "{e.operation}", ...), then reference the name')
         if e.namespace not in self.catalog.namespaces:
             near = _nearest(e.namespace, self.catalog.namespaces)
@@ -286,40 +274,22 @@ class Checker:
                 if isinstance(v, Lit) and isinstance(v.value, str) and v.value in s.bindings:
                     self.warn("catalog", "catalog.literalLooksLikeName", v.pos, f'parameter \'{k}\' is the literal string "{v.value}", which is also a name in scope',
                               f'if you meant the value of {v.value}, write {v.value} (in the structured form: {{"$": "{v.value}"}})')
-        tolerate = []
         if e.options is not None:
             if not isinstance(e.options, RecordE):
-                self.error("syntax", "syntax.options", e.options.pos, "call options must be a record literal { tolerate: [...], region: \"...\" }")
+                self.error("syntax", "syntax.options", e.options.pos, "call options must be a record literal { region: \"...\" }")
             else:
                 for k, v in e.options.fields:
-                    if k == "tolerate":
-                        codes = [it.value if isinstance(it, Lit) and isinstance(it.value, str) else None for it in v.items] if isinstance(v, ListE) else None
-                        if codes is None or any(c is None for c in codes):
-                            self.error("syntax", "syntax.options", v.pos, "tolerate takes a list of error-code strings")
-                            continue
-                        tolerate = codes
-                        for c in codes:
-                            cls = self.catalog.error_class(op, c)
-                            if cls not in (ABSENCE, AUTHORIZATION, AVAILABILITY, STATE):
-                                why = " (the runtime retries transient errors)" if cls == TRANSIENT else " (a validation error is a program bug)" if cls == VALIDATION else ""
-                                self.error("catalog", "catalog.tolerateClass", v.pos, f"'{c}' is classified {cls} and cannot be tolerated; only absence, authorization, availability, and state codes can{why}")
-                            elif c not in op.error_codes and not op.open_error_codes:
-                                self.error("catalog", "catalog.unknownErrorCode", v.pos, f"'{c}' is not an error code of {op.id}")
-                            elif c not in op.error_codes:
-                                self.warn("catalog", "catalog.unmodeledErrorCode", v.pos, f"'{c}' is not a modeled error code of {op.id}; accepted as class {cls}")
-                    elif k == "after":
-                        self.error("syntax", "syntax.options", v.pos, "'after' was removed: ordering comes from data",
+                    if k == "after":
+                        self.error("syntax", "syntax.options", v.pos, "there is no 'after' option: ordering comes from data",
                                    "make the second call depend on the first's result (e.g. Resources: stopped.StoppingInstances.collect(.InstanceId)); mutations without a data dependency run one at a time in source order")
                     elif k in ("region", "profile"):
                         t = self.type_of(v, s.as_pure())
-                        if T.strip_null(t) is not T.STRING and t is not T.ERROR:
+                        if t is not T.STRING and t is not T.ERROR:
                             self.error("types", "type.option", v.pos, f"option '{k}' must be a string, got {t}")
-                        elif T.is_nullable(t):
-                            self.warn("types", "type.nullableToRequired", v.pos, f"option '{k}' is {t}; a Null at runtime stops with a 'data' error naming the element")
                     else:
-                        self.error("syntax", "syntax.options", v.pos, f"unknown call option '{k}'", "options: tolerate, region, profile")
-        self.effects.append(EffectSite(op, e, tolerate, 1 if s.depth == 0 else None, s.depth))
-        return T.nullable(op.output) if tolerate else op.output
+                        self.error("syntax", "syntax.options", v.pos, f"unknown call option '{k}'", "options: region, profile")
+        self.effects.append(EffectSite(op, e, 1 if s.depth == 0 else None, s.depth))
+        return op.output
 
     def _check_params(self, pt, op, e: OpCall):
         if not isinstance(pt, T.TRecord):
@@ -346,16 +316,11 @@ class Checker:
                                "parameters: " + ", ".join(sorted(op.input.fields)))
                 continue
             if not T.assignable(t, expected):
-                if T.assignable(t, expected, relaxed=True):
-                    self.warn("types", "type.nullableToRequired", e.params.pos,
-                              f"'{k}' is {T.describe(t, 1)} but {op.id} requires {T.describe(expected, 1)}; passing it as is is correct: a Null at runtime stops with a 'data' error naming the element",
-                              "there is no default operator; a Null here is a real absence and must be visible")
-                else:
-                    self.error("types", "type.parameter", e.params.pos, f"'{k}' is {T.describe(t, 1)} but {op.id} expects {T.describe(expected, 1)}", None, t)
+                self.error("types", "type.parameter", e.params.pos, f"'{k}' is {T.describe(t, 1)} but {op.id} expects {T.describe(expected, 1)}", None, t)
         required = getattr(op, "required", None)
         for k, t in op.input.fields.items():
             missing = k not in pt.fields
-            if missing and (k in required if required is not None else (not T.is_nullable(t) and not isinstance(t, T.TList))):
+            if missing and (k in required if required is not None else (k not in op.input.optional and not isinstance(t, T.TList))):
                 self.error("catalog", "catalog.missingParameter", e.params.pos, f"{op.id} requires parameter '{k}' ({t})")
 
     # ── stdlib ───────────────────────────────────────────────────────────────
@@ -363,6 +328,10 @@ class Checker:
     def _method(self, e: MethodCall, s):
         target = self.type_of(e.target, s)
         name = e.name
+        if name in BOOL_FNS:
+            if e.args:
+                self.error("syntax", "syntax.arity", e.pos, f"'{name}()' takes no argument")
+            return T.BOOL
         if name in TEST_FNS:
             return self.error("syntax", "syntax.predicateOutside", e.pos, f"'{name}' is a predicate test and is only valid inside where/any/all")
         if name == "for":
@@ -374,14 +343,13 @@ class Checker:
         if target is T.ERROR:
             return T.ERROR
         if not isinstance(target, T.TList):
-            return self.error("types", "type.notList", e.pos, f"'.{name}()' needs a list but the value is {target}",
-                              "the list may be Null (optional member or tolerated call); keep it nullable in a shape, or compact() the outer list first" if T.is_nullable(target) else None, target)
+            return self.error("types", "type.notList", e.pos, f"'.{name}()' needs a list but the value is {target}", _not_list_fix(e.target, target), target)
         elem = target.element
         es = s.with_implicit(elem)
 
         def path(i, what="a path from the element (e.g. .Name)", optional_for_scalars=False):
             if not e.args and optional_for_scalars:
-                if T.is_scalar(T.strip_null(elem)):
+                if T.is_scalar(elem):
                     return elem  # identity path: the element itself
                 self.error("syntax", "syntax.arity", e.pos, f"'{name}' needs {what} when the elements are {elem}; omit the path only for a list of scalars")
                 return None
@@ -419,18 +387,6 @@ class Checker:
             if e.args:
                 self.error("syntax", "syntax.arity", e.pos, f"'{name}()' takes no argument")
 
-        if name == "project":
-            if len(e.args) != 1 or not isinstance(e.args[0], ExprArg):
-                return self.error("syntax", "syntax.arity", e.pos, "'project' takes one path or one shape { field: .path }")
-            x = e.args[0].expr
-            if isinstance(x, RecordE):
-                self._shape(x)
-            t = self.type_of(x, es)
-            if not isinstance(x, RecordE) and not _path_like(x):
-                self.error("syntax", "syntax.argKind", e.args[0].pos, "'project' takes a path (.field) or a shape ({ field: .path }); found another expression")
-            if isinstance(t, T.TList):
-                self.warn("types", "type.nestedList", e.pos, f"project yields list[{t}]; use flat(...) if you want one list")
-            return T.TList(t)
         if name == "flat":
             t = path(0)
             if t is None:
@@ -440,20 +396,15 @@ class Checker:
             if isinstance(t, T.TList):
                 return T.TList(t.element)
             return self.error("types", "type.flatNotList", e.pos, f"flat needs a list-typed path but the path is {t}",
-                              "the member is optional; use ?. plus compact()" if T.is_nullable(t) else "use project(...) for a non-list path", t)
+                              "use collect(...) for a non-list path", t)
         if name == "flatten":
             no_args()
             if isinstance(elem, T.TList):
                 return T.TList(elem.element)
-            return self.error("types", "type.flattenNotNested", e.pos, f"flatten needs list[list[T]] but the value is {target}", None, target)
+            return self.error("types", "type.flattenNotNested", e.pos, f"flatten needs list[list[T]] but the value is {target}",
+                              "use flat(.Member) to flatten a list-typed member of each element" if isinstance(elem, T.TRecord) else None, target)
         if name == "where":
             return target if pred(0) else T.ERROR
-        if name == "compact":
-            no_args()
-            if T.is_nullable(elem):
-                return T.TList(T.strip_null(elem))
-            self.warn("types", "type.needlessCompact", e.pos, f"compact on {target} changes nothing")
-            return target
         if name == "distinct":
             if not e.args:
                 if not T.is_equatable(elem):
@@ -479,13 +430,12 @@ class Checker:
             k = path(0)
             if k is None:
                 return T.ERROR
-            kb = T.strip_null(k)
-            if not (T.is_scalar(kb) or kb is T.ERROR):
+            if not (T.is_scalar(k) or k is T.ERROR):
                 self.error("types", "type.groupKey", e.pos, f"group key must be a scalar, not {k}")
             return T.TList(T.TRecord({"key": k, "items": target}))
         if name == "single":
             no_args()
-            return T.nullable(elem)
+            return elem
         if name == "count":
             no_args()
             return T.INT
@@ -493,37 +443,33 @@ class Checker:
             t = path(0, "a numeric path", optional_for_scalars=True)
             if t is None:
                 return T.ERROR
-            b = T.strip_null(t)
-            if not T.is_numeric(b) and b is not T.ERROR:
+            if not T.is_numeric(t) and t is not T.ERROR:
                 self.error("types", "type.numeric", e.pos, f"sum needs a numeric path, not {t}")
-            return T.INT if b is T.INT else T.NUMBER
+            return T.INT if t is T.INT else T.NUMBER
         if name in ("min", "max"):
             t = path(0, "an ordered scalar path", optional_for_scalars=True)
             if t is None:
                 return T.ERROR
-            b = T.strip_null(t)
-            if not T.is_ordered(b) and b is not T.ERROR:
+            if not T.is_ordered(t) and t is not T.ERROR:
                 self.error("types", "type.ordered", e.pos, f"{name} needs an ordered scalar path, not {t}")
-            return T.nullable(b)
+            return t
         if name == "avg":
             t = path(0, "a numeric path", optional_for_scalars=True)
             if t is None:
                 return T.ERROR
-            b = T.strip_null(t)
-            if not T.is_numeric(b) and b is not T.ERROR:
+            if not T.is_numeric(t) and t is not T.ERROR:
                 self.error("types", "type.numeric", e.pos, f"avg needs a numeric path, not {t}")
-            return T.nullable(T.NUMBER)
+            return T.NUMBER
         if name in ("top", "bottom"):
             if not count_arg(0):
                 return T.ERROR
-            if len(e.args) == 1 and T.is_scalar(T.strip_null(elem)):
+            if len(e.args) == 1 and T.is_scalar(elem):
                 kt = elem
             else:
                 kt = path(1, "an ordered scalar path to rank by")
                 if kt is None:
                     return T.ERROR
-            kb = T.strip_null(kt)
-            if not T.is_ordered(kb) and kb is not T.ERROR:
+            if not T.is_ordered(kt) and kt is not T.ERROR:
                 self.error("types", "type.ordered", e.pos, f"{name} needs an ordered scalar key, not {kt}")
             return T.TList(T.TRecord({"rank": T.INT, "value": elem}))
         if name == "collect":
@@ -531,24 +477,15 @@ class Checker:
             if t is None:
                 return T.ERROR
             if isinstance(t, T.TList):
-                self.warn("types", "type.nestedList", e.pos, f"collect adds one list level: list[{t}]; use flat(...) to flatten first")
-            return T.TList(T.strip_null(t))
+                self.warn("types", "type.nestedList", e.pos, f"collect adds one list level: list[{t}]; use flat(...) if you want one list")
+            return T.TList(t)
         if name in ("any", "all"):
             return T.BOOL if pred(0) else T.ERROR
         return self.error("syntax", "syntax.unknownFunction", e.pos, f"'{name}' is not a TOWL function")
 
-    def _shape(self, r: RecordE):
-        for _, v in r.fields:
-            if isinstance(v, RecordE):
-                self._shape(v)
-            elif isinstance(v, (OpCall, BlockE)):
-                self.error("syntax", "syntax.pureLayer", v.pos, "a shape leaf must be a path, a name, a literal, or a nested shape")
-            elif isinstance(v, MethodCall) and v.name == "for":
-                self.error("syntax", "syntax.pureLayer", v.pos, "for is not allowed inside a shape")
-
     def _for(self, e: MethodCall, target, s):
         if s.pure:
-            self.error("syntax", "syntax.pureLayer", e.pos, "for is not allowed inside a path, shape, predicate, or call arguments")
+            self.error("syntax", "syntax.pureLayer", e.pos, "for is not allowed inside a path, predicate, or call arguments")
         if len(e.args) != 1 or not isinstance(e.args[0], LambdaArg):
             return self.error("syntax", "syntax.argKind", e.pos, "'for' takes exactly one binder: for x in xs")
         lam = e.args[0]
@@ -556,7 +493,7 @@ class Checker:
             self.type_of(lam.body, s.bind(lam.param, T.ERROR).deeper())
             return T.TList(T.ERROR)
         if not isinstance(target, T.TList):
-            return self.error("types", "type.notList", e.pos, f"'for' needs a list but the value is {target}", None, target)
+            return self.error("types", "type.notList", e.pos, f"'for' needs a list but the value is {target}", _not_list_fix(e.target, target), target)
         if lam.param in s.bindings:
             self.error("names", "names.duplicate", lam.pos, f"'{lam.param}' shadows a name in scope")
         before = len(self.effects)
@@ -577,13 +514,13 @@ class Checker:
         return T.TList(body_t)
 
     def _static_length(self, x) -> Optional[int]:
-        """TOWL §7: static length is inductive over literals, project, for, concat."""
+        """TOWL §7: static length is inductive over literals, for, concat."""
         if isinstance(x, ListE):
             return len(x.items)
         if isinstance(x, Ref):
             return self.lengths.get(x.name)
         if isinstance(x, MethodCall):
-            if x.name in ("project", "for"):
+            if x.name == "for":
                 return self._static_length(x.target)
             if x.name == "concat":
                 a = self._static_length(x.target)
@@ -592,10 +529,9 @@ class Checker:
         return None
 
     def _time_fn(self, e: MethodCall, target, s):
-        base = T.strip_null(target)
-        if base is not T.TIMESTAMP and base is not T.ERROR:
+        if target is not T.TIMESTAMP and target is not T.ERROR:
             return self.error("types", "type.timestamp", e.pos, f"'{e.name}' needs a timestamp but the value is {target}",
-                              "timestamps come from the well-known input now (input now: timestamp) or from a timestamp-typed member", target)
+                              "timestamps come from the predefined input now or from a timestamp-typed member", target)
         if e.name.startswith("minus_"):
             if len(e.args) != 1 or not isinstance(e.args[0], ExprArg):
                 return self.error("syntax", "syntax.arity", e.pos, f"'{e.name}' takes one int argument")
@@ -604,22 +540,20 @@ class Checker:
                 self.error("types", "type.int", e.args[0].pos, f"'{e.name}' argument must be an int, not {t}")
         elif e.args:
             self.error("syntax", "syntax.arity", e.pos, f"'{e.name}()' takes no argument")
-        out = T.STRING if e.name == "date" else T.TIMESTAMP
-        return T.nullable(out) if T.is_nullable(target) else out
+        return T.STRING if e.name == "date" else T.TIMESTAMP
 
     def _string_fn(self, e: MethodCall, target, s):
-        base = T.strip_null(target)
-        if base is not T.STRING and base is not T.ERROR:
+        if target is not T.STRING and target is not T.ERROR:
             return self.error("types", "type.string", e.pos, f"'{e.name}' needs a string but the value is {target}", None, target)
         if e.name in ("after_last", "before_first"):
             if len(e.args) != 1 or not isinstance(e.args[0], ExprArg):
                 return self.error("syntax", "syntax.arity", e.pos, f"'{e.name}' takes one string argument")
             t = self.type_of(e.args[0].expr, s.as_pure())
-            if T.strip_null(t) is not T.STRING and t is not T.ERROR:
+            if t is not T.STRING and t is not T.ERROR:
                 self.error("types", "type.string", e.args[0].pos, f"'{e.name}' argument must be a string, not {t}")
         elif e.args:
             self.error("syntax", "syntax.arity", e.pos, f"'{e.name}()' takes no argument")
-        return T.nullable(T.STRING) if T.is_nullable(target) else T.STRING
+        return T.STRING
 
     # ── predicates ───────────────────────────────────────────────────────────
 
@@ -633,55 +567,49 @@ class Checker:
             self._operand_ok(pr.left)
             self._operand_ok(pr.right)
             l = self.type_of(pr.left, es)
-            r = self.type_of(pr.right, es)
+            r = self.type_of(pr.right, es, l)
             if l is T.ERROR or r is T.ERROR:
                 return
-            lb, rb = T.strip_null(l), T.strip_null(r)
             if pr.op in ("==", "!="):
                 if not T.is_equatable(l) or not T.is_equatable(r):
                     self.error("types", "type.notEquatable", pr.pos, f"cannot compare {l} with {r}")
-                elif (l is T.NULL and not T.is_nullable(r)) or (r is T.NULL and not T.is_nullable(l)):
-                    self.error("types", "type.compare", pr.pos, f"null can only be compared with a nullable value, not {r if l is T.NULL else l}",
-                               "use .present()/.absent() on an optional member")
-                elif l is not T.NULL and r is not T.NULL and T.join(lb, rb) is None:
+                elif T.join(l, r) is None:
                     self.error("types", "type.compare", pr.pos, f"cannot compare {l} with {r}", None, l)
             else:
-                if not T.is_ordered(lb) or not T.is_ordered(rb) or T.join(lb, rb) is None:
+                if not T.is_ordered(l) or not T.is_ordered(r) or T.join(l, r) is None:
                     self.error("types", "type.ordered", pr.pos, f"'{pr.op}' needs two ordered values of one type, got {l} and {r}")
         elif isinstance(pr, InP):
             self._operand_ok(pr.left)
             l = self.type_of(pr.left, es)
-            r = self.type_of(pr.right, es, T.TList(T.strip_null(l)))
+            r = self.type_of(pr.right, es, T.TList(l))
             if l is T.ERROR or r is T.ERROR:
                 return
             if not isinstance(r, T.TList):
                 self.error("types", "type.in", pr.pos, f"'in' needs a list on the right, got {r}")
-            elif T.join(T.strip_null(l), r.element) is None:
+            elif T.join(l, r.element) is None:
                 self.error("types", "type.in", pr.pos, f"'in' compares {l} against list[{r.element}]")
         elif isinstance(pr, TestP):
             t = self.type_of(pr.operand, es)
             if pr.fn in ("present", "absent"):
-                if not T.is_nullable(t) and t is not T.ERROR:
-                    self.warn("types", "type.needlessPresent", pr.pos, f"'{pr.fn}()' on a non-nullable value is always {pr.fn == 'present'}")
-            elif pr.fn == "empty":
-                if not isinstance(T.strip_null(t), T.TList) and t is not T.ERROR:
+                return
+            if pr.fn == "empty":
+                if not isinstance(t, T.TList) and t is not T.ERROR:
                     self.error("types", "type.notList", pr.pos, f"'empty()' needs a list operand, got {t}")
             else:
-                if T.strip_null(t) is not T.STRING and t is not T.ERROR:
+                if t is not T.STRING and t is not T.ERROR:
                     self.error("types", "type.string", pr.pos, f"'{pr.fn}' needs a string operand, got {t}")
                 if pr.arg is not None:
                     at = self.type_of(pr.arg, es)
-                    if T.strip_null(at) is not T.STRING and at is not T.ERROR:
+                    if at is not T.STRING and at is not T.ERROR:
                         self.error("types", "type.string", pr.pos, f"'{pr.fn}' argument must be a string, got {at}")
         elif isinstance(pr, QuantP):
             t = self.type_of(pr.operand, es)
             if t is T.ERROR:
                 return
-            l = T.strip_null(t)
-            if not isinstance(l, T.TList):
+            if not isinstance(t, T.TList):
                 self.error("types", "type.notList", pr.pos, f"'{'all' if pr.all else 'any'}' needs a list operand, got {t}")
                 return
-            self._predicate(pr.inner, es.with_implicit(l.element))
+            self._predicate(pr.inner, es.with_implicit(t.element))
 
 
     def _operand_ok(self, x):
@@ -701,6 +629,17 @@ def _path_like(x) -> bool:
     if isinstance(x, (Member, MethodCall)):
         return _path_like(x.target)
     return False
+
+
+def _not_list_fix(src, t):
+    """Name the authored cause when a list function meets a non-list (TOWL §11)."""
+    if isinstance(t, T.TRecord) and t.fields:
+        lists = [k for k, v in t.fields.items() if isinstance(v, T.TList)]
+        if lists:
+            return f"the value is a record; take its list member first, e.g. .{lists[0]}"
+    if isinstance(src, OpCall):
+        return f'call("{src.namespace}", "{src.operation}") returns {t}, not a list'
+    return None
 
 
 _PREDEFINED_INPUTS = {"now": T.TIMESTAMP, "today": T.STRING}  # always available; the runtime binds them

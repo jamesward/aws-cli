@@ -11,8 +11,6 @@ def effect_text(site) -> str:
     if site.op.paged:
         parts.append("paged")
     parts.append(mult)
-    if site.tolerate:
-        parts.append("tolerate " + ",".join(site.tolerate))
     return " ".join(parts)
 
 

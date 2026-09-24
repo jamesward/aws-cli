@@ -1,8 +1,9 @@
 """AWS catalog for TOWL v3 over the vendored botocore service models (CODE_MODE-SPEC.md §3).
 
 Namespaces are AWS service names; operations are exact API PascalCase names. botocore shapes map to
-TOWL types with the profile's member policy: list/map members are defaulted (never null), every
-other non-required member is ``T | Null``. Pageable operations expose the merged output shape;
+TOWL types with the profile's member policy: list/map members are defaulted (never absent), every
+other non-required member is optional (may be absent at runtime; marked ``?`` in renderings, never in
+types). Pageable operations expose the merged output shape;
 pagination members are runtime-owned and never authorable.
 """
 
@@ -265,22 +266,22 @@ class AwsCatalog:
             required = set(getattr(shape, "required_members", ()) or ())
 
             def build(shape=shape, required=required, seen=seen, hide=hide):
-                fields = {}
+                fields, optional = {}, set()
                 for member, ms in shape.members.items():
                     if member in hide:
                         continue
                     mt = self._type_of(service, ms, (), seen)
-                    if member in required or isinstance(mt, T.TList):
-                        fields[member] = mt
-                    else:
-                        fields[member] = T.nullable(mt)
-                return fields
+                    fields[member] = mt
+                    if member not in required and not isinstance(mt, T.TList):
+                        optional.add(member)  # may be absent at runtime; informational only (TOWL §4)
+                return fields, optional
 
             rec = T.TRecord(None, name=name, thunk=build)
             if name:
                 self._types[key] = rec
             else:
-                rec = T.TRecord(build(), name=None)
+                f, o = build()
+                rec = T.TRecord(f, name=None, optional=o)
             return rec
         if kind == "list":
             return T.TList(self._type_of(service, shape.member, (), _seen))
@@ -300,7 +301,7 @@ class AwsCatalog:
         full = self._type_of(service, shape)
         hidden = set(paginator.output_members)
         fields = {k: v for k, v in full.fields.items() if k not in hidden}
-        return T.TRecord(fields, name=None)
+        return T.TRecord(fields, name=None, optional=full.optional & set(fields))
 
     # ── search support (unchanged from the v1 prototype) ─────────────────────
 

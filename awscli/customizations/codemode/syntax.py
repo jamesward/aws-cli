@@ -232,18 +232,29 @@ class Program:
     inputs: List[InputDecl]
     bindings: List[Binding]
     result: Expr
+    warnings: List[Diagnostic] = field(default_factory=list)  # parser normalizations (TOWL §3)
 
 
-EXPR_FNS = {"project", "flat", "flatten", "where", "compact", "distinct", "concat", "group", "single"}
+EXPR_FNS = {"flat", "flatten", "where", "distinct", "concat", "group", "single"}
 AGG_FNS = {"count", "sum", "min", "max", "avg", "collect", "any", "all", "top", "bottom"}
 STR_FNS = {"after_last", "before_first", "lower", "upper"}
 TIME_FNS = {"minus_days", "minus_hours", "minus_minutes", "start_of_day", "start_of_month", "date"}
 TEST_FNS = {"present", "absent", "empty", "contains", "starts_with", "ends_with"}
+BOOL_FNS = {"present", "absent"}  # also value-producing: the only observations of absence (TOWL §9.2)
 PRED_ARG_FNS = {"where", "any", "all"}
 ALL_FNS = EXPR_FNS | AGG_FNS | STR_FNS | TIME_FNS
 FOR_FORM = "the binder is written: for x in xs  then the body: a record on the same line, or bindings and a result on indented lines"
-REMOVED_FNS = {"or": "'.or' was removed: keep the value nullable (T | Null); use ?. to reach through it and pass it to parameters as is",
-               "each": "'each' is now a for expression: " + FOR_FORM, "map": "'map' is now a for expression: " + FOR_FORM}
+ABSENCE_RULE = ("values may be absent at runtime; no null handling is written: an element that needs an absent value is dropped "
+                "and reported under 'losses', and .x.present() / .x.absent() test for absence")
+BORROWED_FNS = {"or": "TOWL has no '.or' and needs none: " + ABSENCE_RULE,
+               "each": "TOWL has no 'each'; " + FOR_FORM, "map": "TOWL has no 'map'; " + FOR_FORM}
+# forms of the earlier nullable revision, read as their TOWL meaning with one warning per kind (TOWL §3)
+NORMALIZATIONS = {
+    "syntax.nullSafe": "'?.' is read as '.'",
+    "syntax.nullCompare": "'== null' / '!= null' are read as .absent() / .present()",
+    "syntax.nullType": "'| Null' in a type is dropped",
+    "syntax.compact": "'.compact()' does nothing (lists never hold absent values) and is dropped",
+}
 TYPE_KEYWORDS = {"string", "int", "number", "bool", "timestamp", "Null", "json", "list"}
 KEYWORDS = {"towl", "input", "in", "for", "call", "true", "false", "null"} | TYPE_KEYWORDS
 CALL_FORM = 'operation calls are written call("service", "Operation", { Param: value }, { region: "..." }); args and options may be omitted'
@@ -311,6 +322,18 @@ class Parser:
         self.shape_lookup = shape_lookup  # (namespace, shape) -> Type | None
         self.depth = _bracket_depths(self.t)  # bracket depth at each token: layout is suspended inside brackets
         self.blocks: List[Optional[int]] = []  # indentation (column) of each open block; None until its first line-starting item
+        self.normalized: dict = {}  # normalization code -> positions (TOWL §3); reported once per code
+
+    def normalize(self, code, pos):
+        self.normalized.setdefault(code, []).append(pos)
+
+    def normalization_warnings(self) -> List[Diagnostic]:
+        out = []
+        for code, positions in self.normalized.items():
+            more = f" (here and {len(positions) - 1} more place(s))" if len(positions) > 1 else ""
+            out.append(Diagnostic("warning", "syntax", code, positions[0], NORMALIZATIONS[code] + more,
+                                  "remove it; " + ABSENCE_RULE))
+        return out
 
     # layout
     def starts_line(self, i=None) -> bool:
@@ -388,7 +411,7 @@ class Parser:
                          fix="the result is the last line of the program; move this binding above it")
             self.err("syntax.trailing", f"unexpected '{self.peek().text}' after the result expression",
                      fix="a program is: towl 3, inputs, bindings (name = expr), then exactly one result expression")
-        return Program(description, inputs, bindings, result)
+        return Program(description, inputs, bindings, result, self.normalization_warnings())
 
     def block_items(self, what):
         """``binding* expr`` at the current block's indentation; the block ends at its result."""
@@ -406,9 +429,11 @@ class Parser:
 
     def type(self) -> T.Type:
         tok = self.peek()
-        if tok.kind == "ident" and tok.text in ("string", "int", "number", "bool", "timestamp", "Null", "json"):
+        if tok.kind == "ident" and tok.text == "Null":
+            self.err("syntax.notInTowl", "'Null' is not a type: absence is not part of any type", tok.pos, "declare the type itself; " + ABSENCE_RULE)
+        if tok.kind == "ident" and tok.text in ("string", "int", "number", "bool", "timestamp", "json"):
             self.p += 1
-            base = {"string": T.STRING, "int": T.INT, "number": T.NUMBER, "bool": T.BOOL, "timestamp": T.TIMESTAMP, "Null": T.NULL, "json": T.JSON}[tok.text]
+            base = {"string": T.STRING, "int": T.INT, "number": T.NUMBER, "bool": T.BOOL, "timestamp": T.TIMESTAMP, "json": T.JSON}[tok.text]
         elif tok.kind == "ident" and tok.text == "list":
             self.p += 1
             self.expect("[")
@@ -435,13 +460,14 @@ class Parser:
                 self.err("syntax.shapeType", f"unknown catalog shape {tok.text}.{shape}", tok.pos)
             base = resolved
         else:
-            self.err("syntax.type", f"expected a type (string, int, number, bool, timestamp, Null, json, list[T], {{ field: T }}) but found '{tok.text}'")
+            self.err("syntax.type", f"expected a type (string, int, number, bool, timestamp, json, list[T], {{ field: T }}) but found '{tok.text}'")
         if self.at("|"):
+            bar = self.t[self.p]
             self.p += 1
             n = self.ident()
             if n.text != "Null":
-                self.err("syntax.type", "only '| Null' may follow a type", n.pos)
-            base = T.nullable(base)
+                self.err("syntax.type", "types have no unions", n.pos)
+            self.normalize("syntax.nullType", bar.pos)
         return base
 
     # expressions
@@ -468,11 +494,19 @@ class Parser:
     def postfix(self, target: Expr) -> Expr:
         dot = self.t[self.p]
         self.p += 1
-        null_safe = dot.text == "?."
+        if dot.text == "?.":
+            self.normalize("syntax.nullSafe", dot.pos)
         name = self.ident()
-        if name.text in REMOVED_FNS and (self.at("(") or self.at("@")):
-            self.err("syntax.removed", REMOVED_FNS[name.text], name.pos)
-        if self.at("(") and not null_safe and (name.text in ALL_FNS or name.text in TEST_FNS):
+        if name.text in BORROWED_FNS and (self.at("(") or self.at("@")):
+            self.err("syntax.notInTowl", BORROWED_FNS[name.text], name.pos)
+        if name.text == "compact" and self.at("("):
+            self.p += 1
+            if not self.at(")"):
+                self.err("syntax.arity", "'compact()' takes no argument", name.pos)
+            self.p += 1
+            self.normalize("syntax.compact", name.pos)
+            return target
+        if self.at("(") and (name.text in ALL_FNS or name.text in TEST_FNS):
             self.p += 1
             args = [] if self.at(")") else self.args(name.text)
             self.expect(")")
@@ -485,7 +519,7 @@ class Parser:
                          f'write call("{ns}", "{name.text}", {{ ... }}); ' + CALL_FORM)
             self.err("syntax.unknownFunction", f"'{name.text}' is not a TOWL function", name.pos,
                      "functions: " + " ".join(sorted(ALL_FNS | TEST_FNS)) + '; an operation is call("service", "Operation", { ... })')
-        return Member(target, name.text, null_safe, name.pos)
+        return Member(target, name.text, False, name.pos)
 
     def for_expr(self) -> Expr:
         """``for x in source`` then a body: a single expression on the same line, or an indented block."""
@@ -580,9 +614,12 @@ class Parser:
         if tok.kind == "num":
             self.p += 1
             return Lit(_number(tok.text), tok.pos)
-        if tok.kind == "ident" and tok.text in ("true", "false", "null"):
+        if tok.kind == "ident" and tok.text in ("true", "false"):
             self.p += 1
-            return Lit({"true": True, "false": False, "null": None}[tok.text], tok.pos)
+            return Lit(tok.text == "true", tok.pos)
+        if tok.kind == "ident" and tok.text == "null":
+            self.err("syntax.notInTowl", "'null' is not a value in TOWL", tok.pos,
+                     "omit an optional parameter or field instead of passing null; " + ABSENCE_RULE)
         if self.at(".") or self.at("?."):
             return self.postfix(Implicit(tok.pos))
         if self.at("("):
@@ -679,6 +716,12 @@ class Parser:
         pos = self.peek().pos
         operand = self.expr()
         if self.peek().kind == "op" and self.peek().text in _CMP:
+            if self.peek().text in ("==", "!=") and self.peek(1).kind == "ident" and self.peek(1).text == "null":
+                # `x == null` from the nullable revision: the absence test
+                self.normalize("syntax.nullCompare", self.peek().pos)
+                fn = "absent" if self.peek().text == "==" else "present"
+                self.p += 2
+                return TestP(operand, fn, None, pos)
             if isinstance(operand, MethodCall) and operand.name in TEST_FNS and self.peek().text in ("==", "!=") \
                     and self.peek(1).kind == "ident" and self.peek(1).text in ("true", "false"):
                 # `.L.empty() == false`: a test compared with a boolean is the test or its negation

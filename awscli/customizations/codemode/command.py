@@ -176,6 +176,9 @@ class ValidateCommand(_Base):
             for w in checked.warnings:
                 sys.stdout.write(f"warning: {w}\n")
             sys.stdout.write(f"result: {checked.result_type}\n")
+            if report["policy"]["approvalReasons"]:
+                flags = (" --allow-mutations" if report["policy"]["mutations"] else "") + " --yes"
+                sys.stdout.write("approval required (" + "; ".join(report["policy"]["approvalReasons"]) + f"): run with{flags} after review\n")
         return 0
 
 
@@ -185,16 +188,11 @@ def _policy(checked, parsed_args, require_flags=True):
     allowed = getattr(parsed_args, "allow_mutations", False)
     if mutations:
         reasons.append(f"{len(mutations)} mutating or unknown-effect call site(s): " + ", ".join(e.op.id for e in mutations))
-    dynamic = [e for e in checked.effects if e.static_width is None]
-    if dynamic:
-        reasons.append("dynamic fan-out width at: " + ", ".join(e.op.id for e in dynamic))
+    # read-only programs within the static threshold need no approval: runtime budgets bound dynamic reach (Code Mode §5.4)
     static_calls = sum(e.static_width or 0 for e in checked.effects)
     threshold = getattr(parsed_args, "approval_call_threshold", 50)
     if static_calls > threshold:
         reasons.append(f"static call estimate {static_calls} exceeds threshold {threshold}")
-    regions = {render._option_literal(e.call, "region") for e in checked.effects} - {None}
-    if len(regions) > 1:
-        reasons.append("multiple regions: " + ", ".join(sorted(regions)))
     return {
         "mutations": len(mutations),
         "mutationsAllowed": allowed if require_flags else None,
@@ -207,12 +205,14 @@ class RunCommand(_Base):
     NAME = "run"
     PATH = "codemode run"
     DESCRIPTION = "Type-check, apply policy, and execute a program. Returns the complete result or a failure envelope."
-    EXAMPLES = ["aws codemode run --plan file://plan.towl --yes",
+    EXAMPLES = ["aws codemode run --plan file://plan.towl",
                 "aws codemode run --plan file://stop.towl --allow-mutations --yes",
                 "aws codemode run --plan file://resume.towl --input done=@prev.json:'fanout[0].completed[].value' --input remaining=@prev.json:'fanout[0].[interrupted, not_started][]'"]
     ARG_TABLE = _PLAN_ARGS + [
         {"name": "yes", "action": "store_true", "help_text": "Skip the confirmation prompt; does not bypass gates."},
         {"name": "allow-mutations", "action": "store_true", "help_text": "Authorize mutating or unknown-effect operations."},
+        {"name": "allow-losses", "action": "store_true", "help_text": "Dispatch mutations even when earlier steps lost elements to absent values (see 'losses'); only after the user accepts them."},
+        {"name": "strict", "action": "store_true", "help_text": "Stop on every error, including failed reads that would otherwise become losses."},
         {"name": "allow-profile-override", "action": "store_true", "help_text": "Permit the per-call profile option."},
         {"name": "max-concurrency", "cli_type_name": "integer", "default": 8, "help_text": "Concurrent AWS requests."},
         {"name": "max-calls", "cli_type_name": "integer", "default": 500, "help_text": "Maximum operation calls in one run; exceeding it stops the program (class budget)."},
@@ -256,7 +256,8 @@ class RunCommand(_Base):
                 inputs[inp.name] = well_known[inp.name]
         calls = ClientAwsCalls(self._session, getattr(parsed_globals, "profile", None), max_items=parsed_args.max_items)
         limits = Limits(parsed_args.max_concurrency, parsed_args.max_width, parsed_args.max_calls, parsed_args.max_result_bytes, float(parsed_args.timeout))
-        envelope = Runtime(self._catalog(), calls, limits).execute(checked, inputs)
+        envelope = Runtime(self._catalog(), calls, limits, allow_losses=getattr(parsed_args, "allow_losses", False),
+                           strict=getattr(parsed_args, "strict", False)).execute(checked, inputs)
         _print(envelope)
         if envelope["status"] == "ok":
             return 0
@@ -278,9 +279,8 @@ def render_codemode_help(catalog=None) -> str:
         "  2. aws codemode schema service.Operation ...         exact parameter/result TYPES for the chosen operations",
         "  3. write ONE program                                using only those operations, parameters, and members",
         "  4. aws codemode validate --plan <src>                typed rendering + effect table; zero AWS calls; fix every diagnostic",
-        "  5. aws codemode run --plan <src> [--allow-mutations] [--yes] [--input name=value]",
-        "     Any runtime error stops the program and returns a failure envelope (what completed, what failed,",
-        "     what never started). Fix or narrow the program and run again; bind completed values as inputs.",
+        "  5. aws codemode run --plan <src> [--allow-mutations] [--yes] [--input name=value]   (--yes when validate lists approval reasons)",
+        "     A runtime error stops the program with a failure envelope (completed, failed, never started); fix or narrow and rerun.",
         "",
         "PROGRAM",
         '  towl 3 "what this does"',
@@ -289,57 +289,60 @@ def render_codemode_help(catalog=None) -> str:
         "  expr                          # exactly one result expression, LAST — its value is the answer; keep it small",
         "  Layout: one item per line; braces are only records; a for body is the lines indented under its for line (2 spaces,",
         "  no tabs); a line starting with '.' continues the previous line. --plan takes inline text, file://path, or - (stdin).",
-        "",
-        "VALUES  \"str\"  12  1.5  true  null  [a, b]  { key: value }",
-        "CALLS (the ONLY effects)  call(\"service\", \"Operation\", { Param: value, ... }, { region: \"us-west-2\", tolerate: [\"NoSuchBucketPolicy\"] })",
+        "VALUES  \"str\"  12  1.5  true  [a, b]  { key: value }      (there is no null)",
+        "CALLS (the ONLY effects)  call(\"service\", \"Operation\", { Param: value, ... }, { region: \"us-west-2\" })",
         "  Service and operation are string literals; args and options may be omitted: call(\"sts\", \"GetCallerIdentity\").",
-        "  Args are checked against the operation's schema. Pagination is automatic and complete — never write",
-        "  NextToken/MaxResults. tolerate makes the listed error codes yield null instead of stopping the program (only",
-        "  absence/authorization/availability/state codes). Ordering comes from data: a call that uses another call's",
-        "  result runs after it; mutations with no data dependency run one at a time in source order. Calls may NOT",
-        "  appear inside paths, shapes, predicates, or another call's args: bind them first.",
-        "MEMBERS  x.Field   x?.Field (when x may be null; the result is nullable too)",
+        "  Args are schema-checked; pagination is automatic and complete (never NextToken/MaxResults). A failed read needs no handling:",
+        "  'does not exist' (NoSuch*, *NotFound) makes it ABSENT; denied, not enabled, or over --max-items drops its list element (a loss);",
+        "  other errors stop, and so does a for where EVERY element is denied (--strict: every error stops).",
+        "  A call using another call's result runs after it; independent mutations run one at a time, in source order.",
+        "  Calls may NOT appear inside paths, predicates, or args: bind them first.",
         "FAN-OUT (the only binder)  for x in list <body> -> list[body type]; bodies are independent and run concurrently.",
-        "  One-line body (a record or any expression):   for b in buckets { bucket: b.Name }",
-        "  Multi-line body: bindings then the result, indented under the for line; the result is the LAST line (see EXAMPLES).",
-        "  for is an expression: bind it (per = for ...) to post-process (per.flatten()). No lambdas ('=>'), no .map/.each,",
-        "  no filters in the header: filter the source (for x in xs.where(...)).",
+        "  Body: a record/expression on the for line (for b in buckets { bucket: b.Name }), or bindings then the result on",
+        "  lines indented under it (result LAST). Bind a for to post-process it (per = for ...; per.flatten()). No lambdas",
+        "  ('=>'), no .map/.each, no filters in the header: filter the source (for x in xs.where(...)).",
         "LIST FUNCTIONS take a PATH from the element (.Field.Sub) or a PREDICATE, never a function:",
-        "  .project(.Field) -> list[T]      .project({ id: .InstanceId, az: .Placement?.AvailabilityZone }) -> list[record]",
-        "  .flat(.Instances) -> list[T]     flattens one list-typed member per element (use this, not project, for a flat list)",
+        "  .collect(.Field) -> list[T]      one value per element;  one record per element: for i in insts { id: i.InstanceId }",
+        "  .flat(.Instances) -> list[T]     flattens one list-typed member per element (use this, not collect, for a flat list)",
         "  .flatten()                       list[list[T]] -> list[T]",
-        "  .where(pred)                     pred: .A == \"x\"  .A != 1  .N < 5 (Null compares false)  .A in [\"x\",\"y\"]  .A.present()  .A.absent()  .L.empty()",
+        "  .where(pred)                     pred: .A == \"x\"  .A != 1  .N < 5  .A in [\"x\",\"y\"]  .A.present()  .A.absent()  .L.empty()",
         "                                   .A.contains(\"s\") .A.starts_with(\"s\") .A.ends_with(\"s\")  .L.any(pred) .L.all(pred)  && || ! ( )",
-        "  .compact()  .distinct()  .distinct(.Key)  .concat(otherList)  .group(.Key) -> list[{ key, items }]  .single() -> T | Null",
-        "AGGREGATES  .count() -> int  .sum(.N) .avg(.N)  .min(.N) .max(.N)  .collect(.Field) -> list  .any(pred) .all(pred)",
+        "  .distinct()  .distinct(.Key)  .concat(otherList)  .group(.Key) -> list[{ key, items }]  .single() -> T",
+        "AGGREGATES  .count() -> int  .sum(.N) .avg(.N)  .min(.N) .max(.N)  .any(pred) .all(pred)",
         "  .top(5, .Size) / .bottom(5, .Size) -> list[{ rank: int, value: T }]   the n largest/smallest by a key (rank is data; lists are unordered)",
-        "  On a list of scalars the path may be omitted: xs.sum()  xs.max()  xs.top(3)",
-        "STRINGS  s.after_last(\".\")  s.before_first(\"/\")  s.lower()  s.upper()      (no truncation exists)",
+        "STRINGS  s.after_last(\".\")  s.before_first(\"/\")  s.lower()  s.upper()  (no truncation).   On a list of scalars the path may be omitted: xs.sum() xs.top(3)",
         "TIME  now (timestamp) and today (\"YYYY-MM-DD\") are predefined; no declaration needed: now.minus_days(4)  .minus_hours(6)  .minus_minutes(30)  .start_of_day()",
         "      .start_of_month()  .date() -> \"YYYY-MM-DD\".  A string literal where a timestamp parameter is expected is a timestamp.",
-        "TYPES  string int number bool timestamp json list[T] { field: T } service.Shape and T | Null (may be absent).",
-        "  T | Null values have no default operator. Pass them to args and options AS IS (a Null at runtime stops with a",
-        "  'data' error naming the element), reach through them with ?., compare them (Null is never equal/less/greater),",
-        "  aggregate them (Null is skipped), and keep them nullable in results (Null is reported as Null).",
+        "TYPES  string int number bool timestamp json list[T] { field: T } service.Shape.  No type is nullable; members are",
+        "  x.Field, and schemas mark the ones a provider may leave out as Field?: T (you write x.Field either way).",
+        "ABSENCE  A member the provider left out, a read of something that does not exist, single()/min()/max()/avg() of nothing is ABSENT.",
+        "  You write no null handling. A function of an absent value is absent; a record field may be absent (shown as null);",
+        "  a list never holds one: that element is DROPPED (a for body, where, group key, aggregator path) and",
+        "  reported under 'losses'. An absent value in a call's args or options STOPS the run (class data): filter first,",
+        "  e.g. for b in buckets.where(.BucketRegion.present()).  x.present() / x.absent() test absence (also as bool values).",
         "",
         "RULES",
         "  - Read each operation's returns type: a record -> access members; a bare value -> the call's value IS the result.",
-        "  - Search by what an operation DOES; instance ids, bucket names, regions are parameter values.",
-        "  - Filter before you fan out; fan out (for) only when each element needs its own call.",
-        "  - group vs flatten is a type: .project(.Instances) gives list[list[...]]; .flat(.Instances) gives list[...].",
-        "  - Order of list elements is not meaningful; there are no first/take/sort functions.",
-        "  - Keep the result SMALL: project only the fields the answer needs.",
+        "  - Search by what an operation DOES (ids, names, regions are parameter values). Filter before you fan out.",
+        "  - group vs flatten is a type: .collect(.Instances) gives list[list[...]]; .flat(.Instances) gives list[...].",
+        "  - Order of list elements is not meaningful; there are no first/take/sort functions. Keep the result SMALL.",
+        "  - Report 'losses' with the result. If a budget or loss makes you narrow the scope, tell the user what was excluded.",
         "",
         "EXAMPLES",
         '  towl 3 "Running instances per region"',
-        '  regions = ["us-east-1", "us-west-2", "eu-west-1"]',
-        "  for r in regions",
+        '  for r in ["us-east-1", "us-west-2", "eu-west-1"]',
         '    insts = call("ec2", "DescribeInstances", { Filters: [{ Name: "instance-state-name", Values: ["running"] }] }, { region: r })',
         "              .Reservations.flat(.Instances)",
         "    { region: r, count: insts.count(), ids: insts.collect(.InstanceId) }   // list[{ region: string, count: int, ids: list[string] }]",
         "",
-        '  towl 3 "Bucket policies"',
-        '  for b in call("s3", "ListBuckets").Buckets { bucket: b.Name, policy: call("s3", "GetBucketPolicy", { Bucket: b.Name }, { tolerate: ["NoSuchBucketPolicy"] })?.Policy }',
+        '  towl 3 "Bucket policies"   (no policy: policy is null; denied: the bucket is a loss)',
+        '  for b in call("s3", "ListBuckets").Buckets { bucket: b.Name, policy: call("s3", "GetBucketPolicy", { Bucket: b.Name }).Policy }',
+        "",
+        '  towl 3 "Top 10 largest S3 objects"   (a denied bucket is dropped and listed in losses)',
+        '  per = for b in call("s3", "ListBuckets").Buckets',
+        '    objs = call("s3", "ListObjectsV2", { Bucket: b.Name }, { region: b.BucketRegion }).Contents',
+        "    for o in objs { bucket: b.Name, key: o.Key, size: o.Size }",
+        "  per.flatten().top(10, .size)",
         "",
         '  towl 3 "Attached storage per running instance"   (two independent calls run concurrently; the for joins them)',
         '  insts = call("ec2", "DescribeInstances", { Filters: [{ Name: "instance-state-name", Values: ["running"] }] }).Reservations.flat(.Instances)',
@@ -349,10 +352,10 @@ def render_codemode_help(catalog=None) -> str:
         "    { id: i.InstanceId, gib: attached.sum(.Size) }",
         "",
         "RESULTS",
-        "  ok:    { status, type, value, tolerated, effects, nodes (per-step element counts), accounting }",
-        "  error: { status, error: { class, code, message, operation, line, element, action }, completed, fanout[]: { completed, failed, interrupted, not_started }, mutations }",
-        "  action: rerun (transient) | rewrite (program bug) | tolerate-candidate (declare tolerate or narrow scope) | budget | mutation",
-        "",
+        "  ok:    { status, type, value, losses[]: { node, line, reason, origin, count, sample }, absorbed, effects, nodes, accounting }",
+        "  error: { status, error: { class, code, message, operation, line, element, action }, completed, losses, fanout[]: { completed, failed, interrupted, not_started }, mutations }",
+        "  action: rerun (transient) | rewrite (program bug) | narrow (drop the denied region/resource, or fix access) | budget | mutation",
+        "          | losses (no mutation ran because data was lost: filter explicitly, or --allow-losses once the user accepts them)",
     ])
 
 

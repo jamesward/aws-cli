@@ -145,11 +145,9 @@ def _render_node(node: dict, r: _Renderer, indent: str, tag: str):
     elif node.get("call") is not None:
         opts = []
         options = node.get("options") or {}
-        if options.get("tolerate"):
-            opts.append("tolerate: [" + ", ".join(quote_text(c) for c in options["tolerate"]) + "]")
-        for k in ("region", "profile"):
-            if options.get(k) is not None:
-                opts.append(f"{k}: {literal(options[k])}")
+        for k, v in options.items():  # every key is rendered, so the checker reports unknown ones
+            if v is not None:
+                opts.append(f"{k}: {literal(v)}")
         service, _, operation = str(node["call"]).partition(".")
         args = node.get("args")
         parts = [quote_text(service), quote_text(operation)]

@@ -8,7 +8,7 @@ import pytest
 from awscli.customizations.codemode import types as T
 from awscli.customizations.codemode import render
 from awscli.customizations.codemode.aws_catalog import classify_error
-from awscli.customizations.codemode.runtime import AwsCalls, Limits, OperationError, Runtime
+from awscli.customizations.codemode.runtime import AwsCalls, Limits, OperationError, Runtime, Stop
 from awscli.customizations.codemode.service import TowlService
 from awscli.customizations.codemode.syntax import BlockE, LambdaArg, MethodCall, OpCall, Parser, RecordE, TowlError
 
@@ -21,23 +21,29 @@ class FakeOp:
     id = property(lambda s: f"{s.namespace}.{s.name}")
 
 
-SYMBOL = T.TRecord({"fqn": T.STRING, "link": T.STRING, "kind": T.nullable(T.STRING)}, name="docs.Symbol")
-INSTANCE = T.TRecord({"InstanceId": T.nullable(T.STRING), "State": T.nullable(T.TRecord({"Name": T.nullable(T.STRING)})), "Tags": T.TList(T.TRecord({"Key": T.nullable(T.STRING), "Value": T.nullable(T.STRING)}))}, name="ec2.Instance")
+def rec(fields, *optional, name=None):
+    return T.TRecord(fields, name=name, optional=optional)
+
+
+SYMBOL = rec({"fqn": T.STRING, "link": T.STRING, "kind": T.STRING}, "kind", name="docs.Symbol")
+INSTANCE = rec({"InstanceId": T.STRING, "State": rec({"Name": T.STRING}, "Name"), "Tags": T.TList(rec({"Key": T.STRING, "Value": T.STRING}, "Key", "Value"))},
+               "InstanceId", "State", name="ec2.Instance")
 
 
 class FakeCatalog:
     namespaces = frozenset({"ec2", "s3", "docs", "store"})
 
     def __init__(self):
-        rec = T.TRecord
         self.ops = {o.id: o for o in [
-            FakeOp("ec2", "DescribeInstances", rec({"Filters": T.TList(rec({"Name": T.nullable(T.STRING), "Values": T.TList(T.STRING)}))}),
+            FakeOp("ec2", "DescribeInstances", rec({"Filters": T.TList(rec({"Name": T.STRING, "Values": T.TList(T.STRING)}, "Name"))}),
                    rec({"Reservations": T.TList(rec({"Instances": T.TList(INSTANCE)}))}), paged=True),
-            FakeOp("ec2", "DescribeVolumes", rec({}), rec({"Volumes": T.TList(rec({"VolumeId": T.nullable(T.STRING), "Size": T.nullable(T.INT), "AvailabilityZone": T.nullable(T.STRING),
-                                                                                    "Attachments": T.TList(rec({"InstanceId": T.nullable(T.STRING)}))}))}), paged=True),
-            FakeOp("ec2", "StopInstances", rec({"InstanceIds": T.TList(T.STRING)}), rec({"StoppingInstances": T.TList(rec({"InstanceId": T.nullable(T.STRING)}))}), effect="mutate"),
-            FakeOp("s3", "ListBuckets", rec({}), rec({"Buckets": T.TList(rec({"Name": T.nullable(T.STRING)}))})),
-            FakeOp("s3", "GetBucketPolicy", rec({"Bucket": T.STRING}), rec({"Policy": T.nullable(T.STRING)}), codes=("NoSuchBucketPolicy",)),
+            FakeOp("ec2", "DescribeVolumes", rec({}), rec({"Volumes": T.TList(rec({"VolumeId": T.STRING, "Size": T.INT, "AvailabilityZone": T.STRING,
+                                                                                    "Attachments": T.TList(rec({"InstanceId": T.STRING}, "InstanceId"))},
+                                                                                   "VolumeId", "Size", "AvailabilityZone"))}), paged=True),
+            FakeOp("ec2", "StopInstances", rec({"InstanceIds": T.TList(T.STRING)}), rec({"StoppingInstances": T.TList(rec({"InstanceId": T.STRING}, "InstanceId"))}), effect="mutate"),
+            FakeOp("s3", "ListBuckets", rec({}), rec({"Buckets": T.TList(rec({"Name": T.STRING, "BucketRegion": T.STRING}, "Name", "BucketRegion"))})),
+            FakeOp("s3", "GetBucketPolicy", rec({"Bucket": T.STRING}), rec({"Policy": T.STRING}, "Policy"), codes=("NoSuchBucketPolicy",)),
+            FakeOp("s3", "ListObjectsV2", rec({"Bucket": T.STRING}), rec({"Contents": T.TList(rec({"Key": T.STRING, "Size": T.INT}, "Key", "Size"))}), paged=True),
             FakeOp("docs", "get_latest_version", rec({"groupId": T.STRING, "artifactId": T.STRING}), rec({"result": T.STRING})),
             FakeOp("docs", "list_symbols", rec({"version": T.STRING}), rec({"result": T.TList(SYMBOL)})),
             FakeOp("docs", "get_doc", rec({"version": T.STRING, "link": T.STRING}), T.STRING),
@@ -85,7 +91,9 @@ class FakeCalls(AwsCalls):
                 return {"Volumes": [{"VolumeId": "v-1", "Size": 8, "AvailabilityZone": "a", "Attachments": [{"InstanceId": "i-1"}]},
                                     {"VolumeId": "v-2", "Size": 100, "AvailabilityZone": "b", "Attachments": []}]}
             if op.id == "s3.ListBuckets":
-                return {"Buckets": [{"Name": "alpha"}, {"Name": "beta"}]}
+                return {"Buckets": getattr(self, "buckets", [{"Name": "alpha"}, {"Name": "beta"}])}
+            if op.id == "s3.ListObjectsV2":
+                return {"Contents": getattr(self, "objects", {}).get(params["Bucket"], [])}
             if op.id == "s3.GetBucketPolicy":
                 return {"Policy": "{}"}
             if op.id == "docs.get_latest_version":
@@ -175,7 +183,7 @@ def test_braces_are_records_and_blocks_are_laid_out():
 
 @pytest.mark.parametrize("bad", ["towl 2 \"x\" 1", "towl 3 xs.map(x => x)", "towl 3 for x in xs x", "towl 3 xs.each(x => x)", "towl 3 for (x in xs) { a: x }", "towl 3 xs.first()",
                                  "towl 3 x = 1", "towl 3 1 2", "towl 3 s3.ListBuckets({})", "towl 3 call(s3, \"ListBuckets\")", "towl 3 xs.where(.a.or(1) == 1)",
-                                 'towl 3 call("ec2", "DescribeInstances").Reservations.project(call("ec2", "DescribeVolumes"))'])
+                                 'towl 3 call("ec2", "DescribeInstances").Reservations.collect(call("ec2", "DescribeVolumes"))'])
 def test_general_purpose_forms_are_rejected(bad):
     with pytest.raises(TowlError):
         service().validate(bad)
@@ -210,27 +218,33 @@ def test_types_the_regions_example():
     assert not c.warnings
 
 
-def test_project_versus_flat_is_a_visible_type():
-    c = service().validate('towl 3 r = call("ec2", "DescribeInstances").Reservations\n{ nested: r.project(.Instances), flat: r.flat(.Instances) }')
+def test_collect_versus_flat_is_a_visible_type_and_project_is_gone():
+    assert errors('towl 3 call("ec2", "DescribeVolumes").Volumes.project(.Size)')[0] == ["syntax.unknownFunction"]
+    c = service().validate('towl 3 r = call("ec2", "DescribeInstances").Reservations\n{ nested: r.collect(.Instances), flat: r.flat(.Instances) }')
     assert str(c.result_type) == "{ nested: list[list[ec2.Instance]], flat: list[ec2.Instance] }"
     assert [w.code for w in c.warnings] == ["type.nestedList"]
 
 
-def test_nullable_access_and_string_functions():
-    codes, _ = errors('towl 3 call("ec2", "DescribeInstances").Reservations.flat(.Instances).project(.State.Name)')
-    assert codes == ["type.nullableAccess"]
-    c = service().validate('towl 3 call("ec2", "DescribeInstances").Reservations.flat(.Instances).project(.State?.Name.upper())')
-    assert str(c.result_type) == "list[string | Null]"
+def test_members_have_one_type_and_nullable_forms_are_normalized():
+    c = service().validate('towl 3 call("ec2", "DescribeInstances").Reservations.flat(.Instances).collect(.State.Name.upper())')
+    assert str(c.result_type) == "list[string]" and not c.warnings
+    # habits from the nullable revision cost no turn: read as their TOWL meaning, one warning per kind
+    c = service().validate('''towl 3
+input xs: list[{ n: int | Null }]
+{ a: call("ec2", "DescribeInstances").Reservations.flat(.Instances).collect(.State?.Name).compact(), b: xs.where(.n == null).count(), c: xs.where(.n != null).count() }''')
+    assert str(c.result_type) == "{ a: list[string], b: int, c: int }"
+    assert sorted(w.code for w in c.warnings) == ["syntax.compact", "syntax.nullCompare", "syntax.nullSafe", "syntax.nullType"]
+    assert all("no null handling is written" in w.fix for w in c.warnings)
+    codes, diags = errors('towl 3 input x: { a: string } call("s3", "GetBucketPolicy", { Bucket: null })')
+    assert codes == ["syntax.notInTowl"] and "omit an optional parameter" in diags[0].fix
 
 
-def test_tolerate_rules():
-    c = service().validate('towl 3 call("s3", "GetBucketPolicy", { Bucket: "b" }, { tolerate: ["NoSuchBucketPolicy"] })?.Policy')
-    assert str(c.result_type) == "string | Null"
-    for code, expect in (("Throttling", "catalog.tolerateClass"), ("ValidationException", "catalog.tolerateClass")):
-        codes, _ = errors(f'towl 3 call("s3", "GetBucketPolicy", {{ Bucket: "b" }}, {{ tolerate: ["{code}"] }})')
-        assert codes == [expect]
-    c = service().validate('towl 3 call("s3", "GetBucketPolicy", { Bucket: "b" }, { tolerate: ["NotFoundError"] })')
-    assert [w.code for w in c.warnings] == ["catalog.unmodeledErrorCode"]
+def test_options_are_catalog_keys_only():
+    codes, diags = errors('towl 3 call("s3", "GetBucketPolicy", { Bucket: "b" }, { tolerate: ["NoSuchBucketPolicy"] }).Policy')
+    assert codes == ["syntax.options"] and "options: region, profile" in diags[0].fix
+    assert errors('towl 3 call("s3", "GetBucketPolicy", { Bucket: "b" }, { retry: 3 })')[0] == ["syntax.options"]
+    # the structured form renders every option key, so unknown ones are reported there too
+    assert errors('{"towl":3,"bindings":[{"name":"p","call":"s3.GetBucketPolicy","args":{"Bucket":"b"},"options":{"tolerate":["X"]}}],"result":"p.Policy"}')[0] == ["syntax.options"]
 
 
 def test_all_diagnostics_in_one_pass_with_where_for_structured_form():
@@ -320,8 +334,8 @@ def test_canonical_order_regardless_of_concurrency():
 def test_group_aggregate_single_and_strings():
     out, _ = run('''towl 3
 vols = call("ec2", "DescribeVolumes").Volumes
-{ by_az: vols.group(.AvailabilityZone).project({ az: .key, n: .items.count(), gib: .items.sum(.Size) }),
-  big: vols.where(.Size > 50).single()?.VolumeId, none: vols.where(.Size > 500).single(), up: "ab".upper() }''')
+{ by_az: for g in vols.group(.AvailabilityZone) { az: g.key, n: g.items.count(), gib: g.items.sum(.Size) },
+  big: vols.where(.Size > 50).single().VolumeId, none: vols.where(.Size > 500).single(), up: "ab".upper() }''')
     assert out["status"] == "ok"
     assert out["value"]["by_az"] == [{"az": "a", "n": 1, "gib": 8}, {"az": "b", "n": 1, "gib": 100}]
     assert out["value"]["big"] == "v-2" and out["value"]["none"] is None and out["value"]["up"] == "AB"
@@ -329,23 +343,53 @@ vols = call("ec2", "DescribeVolumes").Volumes
     assert many["error"]["class"] == "cardinality"
 
 
-def test_tolerate_yields_null_and_is_reported():
-    calls = FakeCalls()
-    calls.fail = lambda op, p, o: OperationError("NoSuchBucketPolicy", "none") if op.id == "s3.GetBucketPolicy" and p["Bucket"] == "beta" else None
-    out, _ = run('towl 3 for b in call("s3", "ListBuckets").Buckets { bucket: b.Name, policy: call("s3", "GetBucketPolicy", { Bucket: b.Name }, { tolerate: ["NoSuchBucketPolicy"] })?.Policy }', calls)
-    assert out["status"] == "ok"
-    assert {r["bucket"]: r["policy"] for r in out["value"]} == {"alpha": "{}", "beta": None}
-    assert out["tolerated"] == [{"line": 1, "operation": "s3.GetBucketPolicy", "code": "NoSuchBucketPolicy", "element": {"Name": "beta"}}]
+POLICIES = 'towl 3 for b in call("s3", "ListBuckets").Buckets { bucket: b.Name, policy: call("s3", "GetBucketPolicy", { Bucket: b.Name }).Policy }'
 
 
-def test_untolerated_failure_stops_and_returns_only_complete_values():
+def test_a_missing_subject_is_an_absent_field_and_a_denied_one_drops_its_element():
     calls = FakeCalls()
-    calls.fail = lambda op, p, o: OperationError("UnauthorizedOperation", "denied", {"code": "UnauthorizedOperation"}) if o.get("region") == "us-west-2" else None
+    calls.buckets = [{"Name": "alpha"}, {"Name": "beta"}, {"Name": "gamma"}]
+    calls.fail = lambda op, p, o: (OperationError("NoSuchBucketPolicy", "none") if p.get("Bucket") == "beta" else
+                                   OperationError("AccessDenied", "no") if p.get("Bucket") == "gamma" else None)
+    out, _ = run(POLICIES, calls)
+    assert out["status"] == "ok", out
+    assert {r["bucket"]: r["policy"] for r in out["value"]} == {"alpha": "{}", "beta": None}, "denied gamma is never reported as having no policy"
+    assert [(a["code"], a["class"]) for a in out["absorbed"]] == [("NoSuchBucketPolicy", "absence"), ("AccessDenied", "authorization")]
+    (loss,) = out["losses"]
+    assert (loss["node"], loss["reason"], loss["sample"]) == ("for", "unknown", [{"Name": "gamma"}])
+    assert loss["origin"] == {"kind": "error", "operation": "s3.GetBucketPolicy", "code": "AccessDenied", "class": "authorization", "line": 1}
+    # present() of a denied read is not 'false': the element is dropped instead
+    calls.fail = lambda op, p, o: OperationError("AccessDenied", "no") if p.get("Bucket") == "gamma" else None
+    out, _ = run('towl 3 for b in call("s3", "ListBuckets").Buckets { b: b.Name, has: call("s3", "GetBucketPolicy", { Bucket: b.Name }).present() }', calls)
+    assert sorted(r["b"] for r in out["value"]) == ["alpha", "beta"] and out["losses"][0]["reason"] == "unknown"
+
+
+def test_failed_reads_stop_outside_elements_when_every_element_fails_and_in_strict_mode():
+    denied = lambda op, p, o: OperationError("AccessDenied", "no")
+    calls = FakeCalls()
+    calls.fail = lambda op, p, o: denied(op, p, o) if op.id == "s3.GetBucketPolicy" else None
+    out, _ = run('towl 3 { p: call("s3", "GetBucketPolicy", { Bucket: "b" }).Policy }', calls)
+    assert out["error"]["class"] == "authorization" and out["error"]["action"] == "narrow", "no element to drop: stop"
+    out, _ = run(POLICIES, calls)
+    assert out["status"] == "error" and out["error"]["code"] == "AccessDenied" and "every one of the 2 elements" in out["error"]["message"]
+    assert out["error"]["operation"] == "s3.GetBucketPolicy" and len(out["fanout"][0]["failed"]) == 2
+    # every element absent is a fact, not a fault
+    calls.fail = lambda op, p, o: OperationError("NoSuchBucketPolicy", "none") if op.id == "s3.GetBucketPolicy" else None
+    out, _ = run(POLICIES, calls)
+    assert out["status"] == "ok" and [r["policy"] for r in out["value"]] == [None, None]
+    checked = service().validate(POLICIES)
+    strict = Runtime(FakeCatalog(), calls, Limits(), strict=True).execute(checked, {})
+    assert strict["status"] == "error" and strict["error"]["class"] == "absence"
+
+
+def test_a_stopping_failure_returns_only_complete_values():
+    calls = FakeCalls()
+    calls.fail = lambda op, p, o: OperationError("InvalidParameterValue", "bad", {"code": "InvalidParameterValue"}) if o.get("region") == "us-west-2" else None
     out, _ = run(REGIONS, calls)
     assert out["status"] == "error"
     err = out["error"]
-    assert (err["class"], err["code"], err["action"], err["operation"]) == ("authorization", "UnauthorizedOperation", "tolerate-candidate", "ec2.DescribeInstances")
-    assert err["element"] == "us-west-2" and err["aws"]["code"] == "UnauthorizedOperation"
+    assert (err["class"], err["code"], err["action"], err["operation"]) == ("validation", "InvalidParameterValue", "rewrite", "ec2.DescribeInstances")
+    assert err["element"] == "us-west-2" and err["aws"]["code"] == "InvalidParameterValue"
     assert set(out["completed"]) == {"regions"}
     fan = out["fanout"][0]
     assert [f["element"] for f in fan["failed"]] == ["us-west-2"]
@@ -399,7 +443,7 @@ vols = call("ec2", "DescribeVolumes").Volumes
   largest: vols.top(1, .Size), smallest: vols.bottom(1, .Size),
   since: now.minus_days(4), day: now.start_of_day(), month: now.start_of_month().date() }'''
     c = service().validate(src)
-    assert str(c.binding_types["vols"]) == "list[{ VolumeId: string | Null, Size: int | Null, AvailabilityZone: string | Null, Attachments: list[{ InstanceId: string | Null }] }]"
+    assert str(c.binding_types["vols"]) == "list[{ VolumeId?: string, Size?: int, AvailabilityZone?: string, Attachments: list[{ InstanceId?: string }] }]"
     assert "top2: list[{ rank: int, value: int }]" in str(c.result_type) and "since: timestamp" in str(c.result_type) and "month: string" in str(c.result_type)
     out, _ = run(src, inputs={"now": "2026-09-14T23:06:17Z", "sizes": [3, 9, 1]})
     assert out["status"] == "ok", out
@@ -412,23 +456,178 @@ vols = call("ec2", "DescribeVolumes").Volumes
     assert errors('towl 3 ("x").minus_days(1)')[0] == ["type.timestamp"]
 
 
-def test_null_has_no_default_operator_and_compares_false():
-    # ordered comparisons accept nullable operands; Null is never <, >, or == a value
-    out, _ = run('towl 3 input xs: list[{ n: int | Null }] { big: xs.where(.n > 1).count(), eq: xs.where(.n == 2).count(), absent: xs.where(.n.absent()).count() }',
-                 inputs={"xs": [{"n": None}, {"n": 2}, {"n": 5}]})
-    assert out["status"] == "ok" and out["value"] == {"big": 2, "eq": 1, "absent": 1}
-    assert out["accounting"]["tolerated"] == 0 and "defaulted" not in out
-    codes, diags = errors('towl 3 input x: { a: string | Null } x.a.or("d")')
-    assert codes == ["syntax.removed"] and ".or' was removed" in diags[0].message
-    # a nullable list needs ?. and stays nullable; there is no .or([])
+def test_predicates_are_three_valued_and_undecided_elements_are_losses():
+    xs = [{"id": "a"}, {"id": "b", "n": 2}, {"id": "c", "n": 5}]
+    src = '''towl 3
+input xs: list[{ id: string, n: int }]
+{ big: xs.where(.n > 1).count(), le: xs.where(.n <= 1).count(), not_gt: xs.where(!(.n > 1)).count(),
+  eq: xs.where(.n == 2).count(), ne: xs.where(.n != 2).count(), absent: xs.where(.n.absent()).count(),
+  either: xs.where(.n.absent() || .n > 4).count(), dec: xs.where(.n > 4 || .id == "a").count() }'''
+    out, _ = run(src, inputs={"xs": xs})
+    assert out["status"] == "ok", out
+    v = out["value"]
+    assert (v["big"], v["eq"], v["ne"], v["absent"], v["either"], v["dec"]) == (2, 1, 1, 1, 2, 2)
+    assert v["le"] == 0 and v["not_gt"] == 0, "De Morgan holds: an element with n absent is in neither"
+    by_line = {(l["node"], l["reason"]) for l in out["losses"]}
+    assert by_line == {("where", "undecided")}
+    assert out["accounting"]["losses"] == 5  # big, le, not_gt, eq, ne each dropped element 'a'
+    assert all(l["origin"] == {"kind": "member", "member": "n", "line": l["origin"]["line"], "col": l["origin"]["col"]} for l in out["losses"])
+    assert all(l["sample"] == [{"id": "a"}] for l in out["losses"])
+
+
+def test_absence_carries_into_fields_and_drops_list_elements_with_losses():
+    src = '''towl 3
+input xs: list[{ id: string, n: int, s: string }]
+{ rows: for x in xs { id: x.id, up: x.s.upper() }, ns: xs.collect(.n), total: xs.sum(.n), top: xs.top(5, .n).count(),
+  groups: xs.group(.s).count(), lit: for x in xs [x.s], flags: xs.collect(.s.present()), m: xs.where(.n > 100).max(.n) }'''
+    out, _ = run(src, inputs={"xs": [{"id": "a", "n": 1}, {"id": "b", "n": 3, "s": "x"}]})
+    assert out["status"] == "ok", out
+    v = out["value"]
+    assert v["rows"] == [{"id": "a", "up": None}, {"id": "b", "up": "X"}], "an absent field keeps its record and is null"
+    assert v["ns"] == [1, 3] and v["total"] == 4 and v["top"] == 2 and v["flags"] == [False, True]
+    assert v["groups"] == 1 and v["lit"] == [["x"], []] and v["m"] is None
+    nodes = sorted((l["node"], l["count"]) for l in out["losses"])
+    assert nodes == [("group", 1), ("list", 1)]
+
+
+def test_for_drops_elements_whose_body_is_absent_and_the_s3_first_draft_is_correct():
+    """TOWL example 8 runs as written; a denied bucket is a loss."""
+    calls = FakeCalls()
+    calls.buckets = [{"Name": "a", "BucketRegion": "us-east-1"}, {"Name": "denied", "BucketRegion": "eu-west-1"}, {"Name": "c", "BucketRegion": "us-west-2"}]
+    calls.objects = {"a": [{"Key": "k1", "Size": 10}, {"Key": "k2"}], "c": [{"Key": "k3", "Size": 30}]}
+    calls.fail = lambda op, p, o: OperationError("AccessDenied", "no") if op.id == "s3.ListObjectsV2" and p["Bucket"] == "denied" else None
+    src = '''towl 3 "Top 10 largest S3 objects"
+buckets = call("s3", "ListBuckets").Buckets
+per = for b in buckets
+  objs = call("s3", "ListObjectsV2", { Bucket: b.Name }, { region: b.BucketRegion }).Contents
+  for o in objs { bucket: b.Name, key: o.Key, size: o.Size }
+per.flatten().top(10, .size)'''
+    c = service().validate(src)
+    assert str(c.result_type) == "list[{ rank: int, value: { bucket: string, key: string, size: int } }]"
+    assert not c.warnings
+    out, _ = run(src, calls)
+    assert out["status"] == "ok", out
+    assert [(r["rank"], r["value"]["key"]) for r in out["value"]] == [(1, "k3"), (2, "k1")]
+    losses = {l["node"]: l for l in out["losses"]}
+    assert losses["for"]["origin"] == {"kind": "error", "operation": "s3.ListObjectsV2", "code": "AccessDenied", "class": "authorization", "line": 4}
+    assert losses["for"]["reason"] == "unknown"
+    assert losses["for"]["sample"] == [{"Name": "denied", "BucketRegion": "eu-west-1"}] and losses["for"]["count"] == 1
+    assert losses["top"]["origin"]["member"] == "Size" and losses["top"]["sample"] == [{"bucket": "a", "key": "k2"}]
+    assert out["accounting"]["losses"] == 2
+    assert any(n["node"] == "for" and n["in"] == 3 and n["out"] == 2 for n in out["nodes"])
+
+
+TOP_OBJECTS = '''towl 3
+per = for b in call("s3", "ListBuckets").Buckets
+  for o in call("s3", "ListObjectsV2", { Bucket: b.Name }).Contents { bucket: b.Name, key: o.Key, size: o.Size }
+per.flatten().top(10, .size)'''
+
+
+def over_budget(names):
+    return lambda op, p, o: Stop("budget", "MaxItems", "too many", op) if op.id == "s3.ListObjectsV2" and p["Bucket"] in names else None
+
+
+def test_a_per_call_budget_inside_a_fan_out_is_a_loss():
+    calls = FakeCalls()
+    calls.max_items = 1000
+    calls.buckets = [{"Name": "small"}, {"Name": "cloudtrail"}]
+    calls.objects = {"small": [{"Key": "a.jar", "Size": 5}]}
+    calls.fail = over_budget({"cloudtrail"})
+    out, calls = run(TOP_OBJECTS, calls)
+    assert out["status"] == "ok", out
+    assert [r["value"]["key"] for r in out["value"]] == ["a.jar"]
+    (loss,) = out["losses"]
+    assert (loss["node"], loss["reason"], loss["sample"]) == ("for", "budget", [{"Name": "cloudtrail"}])
+    assert loss["origin"] == {"kind": "budget", "operation": "s3.ListObjectsV2", "limit": "max-items", "value": 1000, "line": 3}
+    assert [c[1]["Bucket"] for c in calls.calls if c[0] == "s3.ListObjectsV2"].count("small") == 1, "the other buckets are fetched once"
+
+
+def test_a_per_call_budget_stops_outside_an_element_for_every_element_and_under_strict():
+    calls = FakeCalls()
+    calls.fail = over_budget({"x"})
+    out, _ = run('towl 3 call("s3", "ListObjectsV2", { Bucket: "x" }).Contents.count()', calls)
+    assert out["status"] == "error" and (out["error"]["class"], out["error"]["code"], out["error"]["action"]) == ("budget", "MaxItems", "budget")
+    calls = FakeCalls()
+    calls.max_items = 1000
+    calls.fail = over_budget({"alpha", "beta"})
+    out, _ = run(TOP_OBJECTS, calls)
+    assert out["status"] == "error" and out["error"]["code"] == "MaxItems" and "every one of the 2 elements" in out["error"]["message"]
+    assert "--max-items" in out["error"]["message"]
+    calls.fail = over_budget({"beta"})
+    strict = Runtime(FakeCatalog(), calls, Limits(), strict=True).execute(service().validate(TOP_OBJECTS), {})
+    assert strict["status"] == "error" and strict["error"]["class"] == "budget"
+
+
+def test_an_absent_argument_stops_instead_of_dropping():
+    calls = FakeCalls()
+    calls.buckets = [{"Name": "a", "BucketRegion": "us-east-1"}, {"Name": "b"}]
+    src = '''towl 3
+for b in call("s3", "ListBuckets").Buckets
+  { b: b.Name, n: call("s3", "ListObjectsV2", { Bucket: b.Name }, { region: b.BucketRegion }).Contents.count() }'''
+    out, _ = run(src, calls)
+    assert out["status"] == "error"
+    err = out["error"]
+    assert (err["class"], err["code"], err["action"]) == ("data", "AbsentArgument", "rewrite")
+    assert "option 'region'" in err["message"] and "member 'BucketRegion' was absent" in err["message"] and ".where(.BucketRegion.present())" in err["message"]
+    assert err["element"] == {"Name": "b"}
+    # filtering first is the fix, and it costs no loss
+    out, _ = run(src.replace(".Buckets\n", ".Buckets.where(.BucketRegion.present())\n"), calls)
+    assert out["status"] == "ok" and out["losses"] == [] and [r["b"] for r in out["value"]] == ["a"]
+    # nested inside a parameter structure too
+    out, _ = run('towl 3 input xs: list[{ id: string }] for x in xs call("ec2", "DescribeInstances", { Filters: [{ Name: "id", Values: [x.id] }] }).Reservations.count()',
+                 inputs={"xs": [{"id": "i"}, {}]})
+    assert out["error"]["code"] == "AbsentArgument" and "parameter 'Filters[0].Values[0]'" in out["error"]["message"]
+
+
+def test_no_mutation_while_losses_exist_unless_allowed():
+    # an exclusion list that lost an element would widen the mutation: the gate stops before it
+    src = '''towl 3
+input protected: list[{ id: string }]
+insts = call("ec2", "DescribeInstances").Reservations.flat(.Instances)
+keep = protected.collect(.id)
+victims = insts.where(!(.InstanceId in keep)).collect(.InstanceId)
+call("ec2", "StopInstances", { InstanceIds: victims }).StoppingInstances.count()'''
+    calls = FakeCalls()
+    out, calls = run(src, calls, inputs={"protected": [{"id": "i-1"}, {}]})
+    assert out["status"] == "error" and out["error"]["class"] == "losses" and out["error"]["action"] == "losses"
+    assert "ec2.StopInstances" not in [c[0] for c in calls.calls], "nothing was mutated"
+    assert out["losses"][0]["node"] == "collect" and out["accounting"]["losses"] == 1
+    checked = service().validate(src)
+    ok = Runtime(FakeCatalog(), FakeCalls(), Limits(), allow_losses=True).execute(checked, {"protected": [{"id": "i-1"}, {}]})
+    assert ok["status"] == "ok" and ok["value"] == 1 and ok["accounting"]["losses"] == 1
+    clean, _ = run(src, inputs={"protected": [{"id": "i-1"}]})
+    assert clean["status"] == "ok" and clean["losses"] == []
+
+
+def test_absent_result_and_empty_aggregates():
+    out, _ = run('towl 3 call("ec2", "DescribeVolumes").Volumes.where(.Size > 500).single()')
+    assert out["status"] == "error" and out["error"]["code"] == "AbsentResult" and "single() of an empty list" in out["error"]["message"]
+    out, _ = run('towl 3 { m: call("ec2", "DescribeVolumes").Volumes.where(.Size > 500).avg(.Size) }')
+    assert out["status"] == "ok" and out["value"] == {"m": None}
+
+
+def test_losses_are_identical_under_every_schedule():
+    calls_a, calls_b = FakeCalls(), FakeCalls()
+    for c in (calls_a, calls_b):
+        c.buckets = [{"Name": n} for n in "abcdef"]
+        c.objects = {n: [{"Key": f"{n}{i}"} for i in range(3)] for n in "abcdef"}
+    src = 'towl 3 per = for b in call("s3", "ListBuckets").Buckets call("s3", "ListObjectsV2", { Bucket: b.Name }).Contents.top(1, .Size)\nper.count()'
+    a, _ = run(src, calls_a, max_concurrency=8)
+    calls_b.latency = 0.005
+    b, _ = run(src, calls_b, max_concurrency=1)
+    assert a["losses"] == b["losses"] and a["accounting"]["losses"] == 18 and len(a["losses"][0]["sample"]) == 3
+
+
+def test_null_is_not_a_value_and_or_is_removed():
+    codes, diags = errors('towl 3 input x: { a: string } x.a.or("d")')
+    assert codes == ["syntax.notInTowl"] and "has no '.or' and needs none" in diags[0].message
+    assert errors("towl 3 input x: Null x")[0] == ["syntax.notInTowl"]
+    # a read that may fail needs no special form: the old nullable dead end now type-checks
     src = '''towl 3
 for v in call("ec2", "DescribeVolumes").Volumes
-  a = call("ec2", "DescribeInstances", { Filters: [{ Name: "volume", Values: [v.VolumeId] }] }, { tolerate: ["InvalidInstanceID.NotFound"] })
-  { id: v.VolumeId, reservations: a?.Reservations }'''
-    c = service().validate(src)
-    assert "reservations: list[{ Instances: list[ec2.Instance] }] | Null" in str(c.result_type)
-    codes, diags = errors(src.replace("a?.Reservations }", "a?.Reservations.count() }"))
-    assert codes == ["type.notList"] and "compact()" in diags[0].fix
+  a = call("ec2", "DescribeInstances", { Filters: [{ Name: "volume", Values: [v.VolumeId] }] })
+  { id: v.VolumeId, reservations: a.Reservations.count() }'''
+    assert str(service().validate(src).result_type) == "list[{ id: string, reservations: int }]"
     assert errors('towl 3 call("ec2", "DescribeInstances", { Filters: [] })')[0] == ["catalog.emptyListParameter"]
 
 
@@ -443,11 +642,11 @@ def test_now_and_today_are_predefined_and_a_declaration_wins():
     assert errors("towl 3 { r: region }")[0] == ["names.undefined"]  # region still needs a declaration
 
 
-def test_service_names_are_ordinary_names_and_call_options_may_be_nullable():
+def test_service_names_are_ordinary_names_and_call_options_are_plain_values():
     out, _ = run('towl 3 s3 = call("ec2", "DescribeVolumes").Volumes  { ec2: s3.count() }')
     assert out["status"] == "ok" and out["value"] == {"ec2": 2}
-    c = service().validate('towl 3 input r: { name: string | Null } call("ec2", "DescribeVolumes", {}, { region: r.name }).Volumes')
-    assert [w.code for w in c.warnings] == ["type.nullableToRequired"]
+    c = service().validate('towl 3 input r: { name: string } call("ec2", "DescribeVolumes", {}, { region: r.name }).Volumes')
+    assert not c.warnings
     codes, diags = errors('towl 3 call("s33", "DescribeVolumes")')
     assert codes == ["catalog.unknownNamespace"] and "did you mean: s3" in diags[0].fix
 

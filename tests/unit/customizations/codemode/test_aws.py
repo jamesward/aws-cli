@@ -45,17 +45,18 @@ def test_member_policy_lists_defaulted_others_optional(catalog):
     assert isinstance(res, T.TList) and isinstance(res.element.fields["Instances"], T.TList)
     inst = res.element.fields["Instances"].element
     assert str(inst) == "ec2.Instance"
-    assert str(inst.fields["InstanceId"]) == "string | Null"
-    assert str(inst.fields["Tags"]) == "list[ec2.Tag]"
-    assert str(inst.fields["State"]) == "ec2.InstanceState | Null"
+    assert str(inst.fields["InstanceId"]) == "string" and "InstanceId" in inst.optional
+    assert str(inst.fields["Tags"]) == "list[ec2.Tag]" and "Tags" not in inst.optional
+    assert str(inst.fields["State"]) == "ec2.InstanceState" and "State" in inst.optional
     inp = op.input
-    assert "NextToken" not in inp.fields and str(inp.fields["Filters"]) == "list[ec2.Filter]" and str(inp.fields["DryRun"]) == "bool | Null"
+    assert "NextToken" not in inp.fields and str(inp.fields["Filters"]) == "list[ec2.Filter]" and str(inp.fields["DryRun"]) == "bool"
+    assert "InstanceId?: string" in T.describe(inst, 1), "optional members are marked for the author, never in the type"
 
 
 def test_required_input_members_and_error_codes(catalog):
     gbp = catalog.operation("s3", "GetBucketPolicy")
-    assert str(gbp.input.fields["Bucket"]) == "string" and gbp.open_error_codes
-    assert str(gbp.output) == "s3.GetBucketPolicyOutput" and str(gbp.output.fields["Policy"]) == "string | Null"
+    assert str(gbp.input.fields["Bucket"]) == "string" and gbp.open_error_codes and "Bucket" not in gbp.input.optional
+    assert str(gbp.output) == "s3.GetBucketPolicyOutput" and str(gbp.output.fields["Policy"]) == "string" and "Policy" in gbp.output.optional
     tag = catalog.operation("ec2", "CreateTags")
     assert str(tag.output) == "{}"
 
@@ -66,7 +67,7 @@ def test_map_members_become_key_value_lists(catalog):
     # a modeled map: sts AssumeRole has none; use lambda-free check on iam SimulatePrincipalPolicy context? keep generic:
     lam = AwsCatalog(services=["lambda"]).operation("lambda", "GetFunctionConfiguration")
     env = lam.output.fields["Environment"]
-    variables = T.strip_null(env).fields["Variables"]
+    variables = env.fields["Variables"]
     assert isinstance(variables, T.TList) and set(variables.element.fields) == {"key", "value"}
 
 
@@ -80,22 +81,28 @@ for r in regions
             .Reservations.flat(.Instances)
   { region: r, count: insts.count(), ids: insts.collect(.InstanceId) }''', "list[{ region: string, count: int, ids: list[string] }]"),
     "bucket_policies": ('''towl 3 "Bucket policies"
-for b in call("s3", "ListBuckets").Buckets { bucket: b.Name, policy: call("s3", "GetBucketPolicy", { Bucket: b.Name }, { tolerate: ["NoSuchBucketPolicy"] })?.Policy }''',
-                        "list[{ bucket: string | Null, policy: string | Null }]"),
+for b in call("s3", "ListBuckets").Buckets { bucket: b.Name, policy: call("s3", "GetBucketPolicy", { Bucket: b.Name }).Policy }''',
+                        "list[{ bucket: string, policy: string }]"),
     "volumes_by_az": ('''towl 3 "Volume storage by availability zone"
-call("ec2", "DescribeVolumes").Volumes.group(.AvailabilityZone).project({ az: .key, volumes: .items.count(), gib: .items.sum(.Size) })''',
-                      "list[{ az: string | Null, volumes: int, gib: int }]"),
+for g in call("ec2", "DescribeVolumes").Volumes.group(.AvailabilityZone) { az: g.key, volumes: g.items.count(), gib: g.items.sum(.Size) }''',
+                      "list[{ az: string, volumes: int, gib: int }]"),
     "join": ('''towl 3 "Attached storage per running instance"
 insts = call("ec2", "DescribeInstances", { Filters: [{ Name: "instance-state-name", Values: ["running"] }] }).Reservations.flat(.Instances)
 vols  = call("ec2", "DescribeVolumes").Volumes
 for i in insts
   attached = vols.where(.Attachments.any(.InstanceId == i.InstanceId))
   { id: i.InstanceId, volumes: attached.count(), gib: attached.sum(.Size) }''',
-             "list[{ id: string | Null, volumes: int, gib: int }]"),
+             "list[{ id: string, volumes: int, gib: int }]"),
     "mutations": ('''towl 3 "Stop then tag"
 stopped = call("ec2", "StopInstances", { InstanceIds: ["i-0123"] })
 tagged  = call("ec2", "CreateTags", { Resources: stopped.StoppingInstances.collect(.InstanceId), Tags: [{ Key: "state", Value: "stopped" }] })
 { stopped: stopped.StoppingInstances.collect(.InstanceId), tagged: tagged }''', "{ stopped: list[string], tagged: {} }"),
+    "top_objects": ('''towl 3 "Top 10 largest S3 objects"
+buckets = call("s3", "ListBuckets").Buckets
+per = for b in buckets
+  objs = call("s3", "ListObjectsV2", { Bucket: b.Name }, { region: b.BucketRegion }).Contents
+  for o in objs { bucket: b.Name, key: o.Key, size: o.Size }
+per.flatten().top(10, .size)''', "list[{ rank: int, value: { bucket: string, key: string, size: int } }]"),
 }
 
 
@@ -114,7 +121,7 @@ def test_required_list_parameters_are_enforced(service):
     assert [d.code for d in e.value.diagnostics] == ["syntax.argKind"]
     with pytest.raises(TowlError) as e:
         service.validate('towl 3 call("ec2", "DescribeVolumes").Volumes.where(.Size == null && null == 1)')
-    assert [d.code for d in e.value.diagnostics] == ["type.compare"]
+    assert [d.code for d in e.value.diagnostics] == ["syntax.notInTowl"]
 
 
 def test_read_after_mutation_does_not_deadlock_and_mutations_serialize(catalog, service):
@@ -150,7 +157,9 @@ tagged = for k in ["a", "b"] call("ec2", "CreateTags", { Resources: ["i-1"], Tag
 { after: after.count(), tagged: tagged.count() }'''
     out = Runtime(catalog, Calls(), Limits(max_concurrency=8)).execute(service.validate(src), {})
     assert out["status"] == "ok", out
-    assert order[0] == "ec2.StopInstances" and order.index("ec2.DescribeInstances") < order.index("ec2.CreateTags")
+    # the mutation comes first (its dependent read waits for it); `tagged` shares no data with `after`, so Code Mode
+    # §5.1 promises no order between them — only that mutations never overlap
+    assert order[0] == "ec2.StopInstances" and order.count("ec2.CreateTags") == 2 and "ec2.DescribeInstances" in order
     assert Calls.overlap is False, "mutations never overlap each other"
 
 
@@ -183,24 +192,42 @@ class FakeAws(AwsCalls):
         raise AssertionError(op.id)
 
 
-def test_runtime_regions_with_failure_envelope(catalog, service):
+def test_runtime_regions_an_opt_in_region_is_a_loss(catalog, service):
     checked = service.validate(EXAMPLES["regions"][0])
     out = Runtime(catalog, FakeAws(), Limits()).execute(checked, {})
-    assert out["status"] == "error"
-    assert out["error"]["class"] == "availability" and out["error"]["code"] == "OptInRequired" and out["error"]["element"] == "eu-west-1"
-    assert out["error"]["action"] == "tolerate-candidate"
-    fan = out["fanout"][0]
+    assert out["status"] == "ok", out
+    assert sorted(r["region"] for r in out["value"]) == ["us-east-1", "us-west-2"]
+    (loss,) = out["losses"]
+    assert loss["sample"] == ["eu-west-1"] and loss["origin"]["code"] == "OptInRequired" and loss["origin"]["class"] == "availability"
+    strict = Runtime(catalog, FakeAws(), Limits(), strict=True).execute(checked, {})
+    assert strict["status"] == "error" and strict["error"]["element"] == "eu-west-1" and strict["error"]["action"] == "narrow"
+    fan = strict["fanout"][0]
     assert [f["element"] for f in fan["failed"]] == ["eu-west-1"]
-    assert {c["element"] for c in fan["completed"]} | set(fan["interrupted"]) | set(fan["not_started"]) == {"us-east-1", "us-west-2"}
-    assert set(out["completed"]) == {"regions"} and "value" not in out
+    assert set(strict["completed"]) == {"regions"} and "value" not in strict
 
 
-def test_runtime_tolerate_over_real_models(catalog, service):
+def test_runtime_absorbed_absence_over_real_models(catalog, service):
     checked = service.validate(EXAMPLES["bucket_policies"][0])
     out = Runtime(catalog, FakeAws(), Limits()).execute(checked, {})
     assert out["status"] == "ok"
     assert {r["bucket"]: r["policy"] for r in out["value"]} == {"a": "{}", "b": None}
-    assert out["tolerated"][0]["code"] == "NoSuchBucketPolicy"
+    assert out["absorbed"][0]["code"] == "NoSuchBucketPolicy" and out["losses"] == []
+
+
+def test_top_objects_example_over_real_models_reports_losses(catalog, service):
+    """TOWL example 8 against the real s3 models: a denied bucket and an object without Size are losses, not retries."""
+    class Aws(AwsCalls):
+        def invoke(self, op, params, options):
+            if op.id == "s3.ListBuckets":
+                return {"Buckets": [{"Name": "a", "BucketRegion": "us-east-1"}, {"Name": "logs", "BucketRegion": "eu-west-1"}]}
+            if params["Bucket"] == "logs":
+                raise OperationError("AccessDenied", "denied", {"code": "AccessDenied", "class": "authorization"})
+            return {"Contents": [{"Key": "big.jar", "Size": 41516873}, {"Key": "odd"}]}
+
+    out = Runtime(catalog, Aws(), Limits()).execute(service.validate(EXAMPLES["top_objects"][0]), {})
+    assert out["status"] == "ok", out
+    assert out["value"] == [{"rank": 1, "value": {"bucket": "a", "key": "big.jar", "size": 41516873}}]
+    assert sorted((l["node"], l["origin"]["kind"]) for l in out["losses"]) == [("for", "error"), ("top", "member")]
 
 
 def test_client_adapter_maps_botocore_errors_to_operation_errors(catalog):
@@ -303,10 +330,10 @@ def test_exact_schema_lists_required_params_and_resolves_shapes(catalog):
     ops = r["queries"][0]["matches"][0]
     assert "required" in ops and ops["required"] == []
     shape = r["queries"][1]["matches"][0]
-    assert shape["shape"] == "ec2.Filter" and shape["fields"].startswith("{ Name: string | Null")
+    assert shape["shape"] == "ec2.Filter" and shape["fields"].startswith("{ Name?: string")
     assert "Unknown exact operation or shape" in r["queries"][2]["diagnostics"][0]
     text = render_schema_text(r)
-    assert "ec2.Filter = { Name: string | Null" in text and "required: none" in text
+    assert "ec2.Filter = { Name?: string" in text and "required: none" in text and "reported in 'losses'" in text
 
 
 def test_exact_schema_accepts_both_spellings(catalog):
@@ -314,7 +341,7 @@ def test_exact_schema_accepts_both_spellings(catalog):
     r = s.exact(["s3.GetBucketPolicy", "ec2:describe-volumes", "nope.Thing"])
     assert r["count"] == 2
     gbp = r["queries"][0]["matches"][0]
-    assert gbp["params"] == "{ Bucket: string, ExpectedBucketOwner: string | Null }" and gbp["returns"] == "{ Policy: string | Null }"
+    assert gbp["params"] == "{ Bucket: string, ExpectedBucketOwner?: string }" and gbp["returns"] == "{ Policy?: string }"
     vol = r["queries"][1]["matches"][0]
     assert vol["runtimeOwned"] == ["NextToken", "MaxResults"]
     assert r["queries"][2]["diagnostics"]
@@ -330,7 +357,9 @@ def test_help_is_plain_text_and_names_nothing_absent():
     assert "summarize" not in text and "truncate" not in text and "llm." not in text
     assert "NextToken" in text
     assert '"bindings"' not in text and '{"$"' not in text, "the CLI guide teaches the text form only"
-    assert len(text.splitlines()) < 120
+    assert "?." not in text and "| Null" not in text and ".compact()" not in text, "the guide teaches no null handling"
+    assert "losses" in text and "ListObjectsV2" in text
+    assert len(text.splitlines()) < 90
 
 
 def test_public_help_prints_plain_text(capsys):
@@ -341,9 +370,9 @@ def test_public_help_prints_plain_text(capsys):
 
 def test_dedented_continuation_applies_to_the_for_and_tests_compare_with_booleans(catalog, service):
     src = '''towl 3
-regions = call("ec2", "DescribeRegions").Regions.project(.RegionName).compact()
+regions = call("ec2", "DescribeRegions").Regions.collect(.RegionName)
 functions = for r in regions
-              call("ec2", "DescribeVolumes", {}, { region: r }).Volumes.project({ az: .AvailabilityZone })
+              call("ec2", "DescribeVolumes", {}, { region: r }).Volumes.collect(.AvailabilityZone)
             .flatten()
 insts = call("ec2", "DescribeInstances").Reservations.flat(.Instances)
 { f: functions.count(), e: insts.where(.Tags.empty() == false).count(), ne: insts.where(.Tags.empty() != true).count() }'''
@@ -404,7 +433,7 @@ class _Globals:
 def _cmd(cls, session, **kw):
     from types import SimpleNamespace
     cmd = cls(session)
-    defaults = dict(plan=None, input=[], max_width=200, yes=True, allow_mutations=False, allow_profile_override=False,
+    defaults = dict(plan=None, input=[], max_width=200, yes=True, allow_mutations=False, allow_losses=False, strict=False, allow_profile_override=False,
                     max_concurrency=4, max_calls=500, max_items=1000, max_result_bytes=1 << 20, timeout=60, approval_call_threshold=50)
     defaults.update(kw)
     return cmd, SimpleNamespace(**defaults)
@@ -437,5 +466,66 @@ def test_run_command_gates_mutations_then_executes(catalog, capsys, monkeypatch)
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "ok" and {r["bucket"] for r in out["value"]} == {"a", "b"}
     cmd, args = _cmd(RunCommand, Session(), plan=EXAMPLES["regions"][0])
+    assert cmd._run_main(args, _Globals()) == 0
+    assert json.loads(capsys.readouterr().out)["accounting"]["losses"] == 1
+    cmd, args = _cmd(RunCommand, Session(), plan=EXAMPLES["regions"][0], strict=True)
     assert cmd._run_main(args, _Globals()) == 254
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "OptInRequired"
+
+
+def test_run_command_passes_allow_losses_and_validate_names_the_yes_flag(catalog, capsys, monkeypatch):
+    monkeypatch.setattr("awscli.customizations.codemode.command.AwsCatalog", lambda session: catalog)
+    seen = {}
+
+    class Rt:
+        def __init__(self, catalog, calls, limits, allow_losses=False, strict=False):
+            seen["allow_losses"] = allow_losses
+
+        def execute(self, checked, inputs):
+            return {"status": "ok", "value": 1, "losses": []}
+
+    monkeypatch.setattr("awscli.customizations.codemode.command.Runtime", Rt)
+    monkeypatch.setattr("awscli.customizations.codemode.command.ClientAwsCalls", lambda session, profile, max_items: FakeAws())
+
+    class Session:
+        def get_config_variable(self, name):
+            return "us-east-1"
+
+    cmd, args = _cmd(RunCommand, Session(), plan=EXAMPLES["bucket_policies"][0], allow_losses=True)
+    assert cmd._run_main(args, _Globals()) == 0 and seen["allow_losses"] is True
+    capsys.readouterr()
+
+    class Text(_Globals):
+        output = "text"
+
+    cmd, args = _cmd(ValidateCommand, object(), plan=EXAMPLES["bucket_policies"][0])
+    assert cmd._run_main(args, Text()) == 0
+    out = capsys.readouterr().out
+    assert "approval required" not in out, "a read-only dynamic fan-out needs no --yes"
+    cmd, args = _cmd(ValidateCommand, object(), plan=EXAMPLES["mutations"][0])
+    assert cmd._run_main(args, Text()) == 0
+    out = capsys.readouterr().out
+    assert "approval required (2 mutating" in out and "run with --allow-mutations --yes after review" in out
+    wide = 'towl 3 for r in [' + ", ".join(f'"r{i}"' for i in range(60)) + '] call("sts", "GetCallerIdentity", {}, { region: r }).Account'
+    cmd, args = _cmd(ValidateCommand, object(), plan=wide)
+    assert cmd._run_main(args, Text()) == 0
+    assert "static call estimate 60 exceeds threshold 50" in capsys.readouterr().out
+
+
+def test_read_only_dynamic_multi_region_run_needs_no_yes(catalog, capsys, monkeypatch):
+    monkeypatch.setattr("awscli.customizations.codemode.command.AwsCatalog", lambda session: catalog)
+    monkeypatch.setattr("awscli.customizations.codemode.command.ClientAwsCalls", lambda session, profile, max_items: FakeAws())
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    class Session:
+        def get_config_variable(self, name):
+            return "us-east-1"
+
+    two_regions = 'towl 3 { a: call("s3", "ListBuckets", {}, { region: "us-east-1" }).Buckets.count(), b: call("s3", "ListBuckets", {}, { region: "eu-west-1" }).Buckets.count() }'
+    for plan in (EXAMPLES["bucket_policies"][0], two_regions):
+        cmd, args = _cmd(RunCommand, Session(), plan=plan, yes=False)
+        assert cmd._run_main(args, _Globals()) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "ok"
+    cmd, args = _cmd(RunCommand, Session(), plan=EXAMPLES["mutations"][0], yes=False, allow_mutations=True)
+    assert cmd._run_main(args, _Globals()) == 252
+    assert json.loads(capsys.readouterr().out)["status"] == "policy_rejected"

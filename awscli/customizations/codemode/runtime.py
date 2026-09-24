@@ -1,8 +1,12 @@
 """TOWL v3 runtime (TOWL_SPEC.md §§12–13) for the AWS profile (CODE_MODE-SPEC.md §5).
 
-Values are plain JSON. Top-level bindings run as soon as their dependencies are values; ``for``
-bodies with calls run as a wave. Every error stops the program except a declared ``tolerate`` code,
-and a stopped run returns the failure envelope with only complete values. Pagination is complete
+Values are plain JSON plus ``Absent`` (TOWL §9.2): a function of an absent value is absent, record fields may
+be absent, lists never hold one — an element that would is dropped and recorded in the loss log — and an absent
+value in a call's args or options stops the run. Top-level bindings run as soon as their dependencies are values; ``for``
+bodies with calls run as a wave. A failed read is classified (TOWL §12.4): ``absence`` yields an absent value,
+``authorization``/``availability`` an *unknown* one that drops its enclosing element, anything else stops; a wave
+that loses every element to unknowns stops too. A stopped run returns the failure envelope with only complete values. No mutation is
+dispatched while losses exist unless losses are allowed. Pagination is complete
 and invisible (botocore paginators); transient retries are botocore's.
 """
 
@@ -24,7 +28,7 @@ from .syntax import (
 
 
 class OperationError(Exception):
-    """Raised by AwsCalls; ``code`` is what ``tolerate`` matches against."""
+    """Raised by AwsCalls; ``code`` is classified to decide whether the failure is absorbed or stops the run."""
 
     def __init__(self, code, message, aws=None):
         super().__init__(message)
@@ -36,6 +40,39 @@ class Stop(Exception):
     def __init__(self, cls, code, message, op=None, pos=None, element=None, has_element=False, aws=None):
         super().__init__(message)
         self.cls, self.code, self.op, self.pos, self.element, self.has_element, self.aws = cls, code, op, pos, element, has_element, aws or {}
+
+
+class Absent:
+    """A runtime absence (TOWL §9.2). Not a value a program can write; carries where it first became absent.
+
+    ``origin`` is one of ``{kind: member, member, line, col}``, ``{kind: error, operation, code, class, line}``,
+    ``{kind: empty, function, line}``. Record fields may hold an Absent (serialized as null); lists never do.
+    An *unknown* Absent (a read that could not be done) makes any record holding it unknown, so it always drops
+    its element instead of becoming a null field."""
+
+    __slots__ = ("origin", "unknown")
+
+    def __init__(self, origin, unknown=False):
+        self.origin, self.unknown = origin, unknown
+
+    def __repr__(self):
+        return f"Absent({self.origin}{', unknown' if self.unknown else ''})"
+
+
+def is_absent(v) -> bool:
+    return isinstance(v, Absent)
+
+
+def describe_origin(o) -> str:
+    if o.get("kind") == "member":
+        return f"member '{o['member']}' was absent (line {o['line']})"
+    if o.get("kind") == "error":
+        return f"{o['operation']} failed with {o['code']} ({o['class']}, line {o['line']})"
+    if o.get("kind") == "budget":
+        return f"{o['operation']} returned more than {o['value']} items, over --{o['limit']} (line {o['line']}); rerun with a higher --{o['limit']} to include it"
+    if o.get("kind") == "empty":
+        return f"{o['function']}() of an empty list (line {o['line']})"
+    return "a value was absent"
 
 
 class AwsCalls:
@@ -134,24 +171,28 @@ class Limits:
 
 
 class _Env:
-    __slots__ = ("names", "implicit", "has_implicit", "element", "in_each")
+    __slots__ = ("names", "implicit", "has_implicit", "element", "in_each", "args")
 
-    def __init__(self, names, implicit=None, has_implicit=False, element=None, in_each=False):
+    def __init__(self, names, implicit=None, has_implicit=False, element=None, in_each=False, args=False):
         self.names, self.implicit, self.has_implicit, self.element, self.in_each = names, implicit, has_implicit, element, in_each
+        self.args = args  # evaluating call args/options: lists keep Absent so the call can stop on it (TOWL §6.1)
 
     def bind(self, n, v):
-        return _Env({**self.names, n: v}, self.implicit, self.has_implicit, self.element, self.in_each)
+        return _Env({**self.names, n: v}, self.implicit, self.has_implicit, self.element, self.in_each, self.args)
 
     def with_element(self, v):
-        return _Env(self.names, v, True, self.element, self.in_each)
+        return _Env(self.names, v, True, self.element, self.in_each, self.args)
 
     def for_element(self, n, v):
-        return _Env({**self.names, n: v}, self.implicit, self.has_implicit, v, True)
+        return _Env({**self.names, n: v}, self.implicit, self.has_implicit, v, True, self.args)
+
+    def for_args(self):
+        return _Env(self.names, self.implicit, self.has_implicit, self.element, self.in_each, True)
 
 
 class _Run:
-    def __init__(self, checked, inputs, limits):
-        self.c, self.inputs, self.limits = checked, inputs, limits
+    def __init__(self, checked, inputs, limits, allow_losses=False, strict=False):
+        self.c, self.inputs, self.limits, self.allow_losses, self.strict = checked, inputs, limits, allow_losses, strict
         # bodies of nested waves block on their children, so the pool must never be the limit: the
         # semaphore bounds provider concurrency; threads are cheap and created on demand
         self.pool = ThreadPoolExecutor(max_workers=4096)
@@ -164,13 +205,42 @@ class _Run:
         self.in_flight_mutations = 0
         self.nodes: Dict[str, dict] = {}
         self.effects: Dict[str, dict] = {}
-        self.tolerated: List[dict] = []
+        self.absorbed: List[dict] = []
         self.mutations: List[dict] = []
         self.fanouts: Dict[str, dict] = {}
         self.completed: Dict[str, Any] = {}
+        self.losses: Dict[tuple, dict] = {}
         self.waves = 0
         self.result_bytes = 0
         self.started = time.monotonic()
+
+    def loss(self, node, pos, absent: "Absent", element=None, has_element=False, reason="absent"):
+        """Record one dropped or skipped element (TOWL §12.6). Samples are the canonically smallest three, so the
+        log is identical under every schedule (invariant 14)."""
+        origin = absent.origin
+        if absent.unknown:
+            reason = "budget" if origin.get("kind") == "budget" else "unknown"
+        key = (node, pos.line, pos.col, reason, _canonical(origin))
+        sample = _abbrev(element) if has_element else None
+        with self.lock:
+            rec = self.losses.get(key)
+            if rec is None:
+                rec = self.losses[key] = {"node": node, "line": pos.line, "col": pos.col, "reason": reason, "origin": dict(origin),
+                                          "count": 0, "sample": []}
+            rec["count"] += 1
+            if has_element:
+                s = rec["sample"]
+                c = _canonical(sample)
+                if all(_canonical(x) != c for x in s):
+                    s.append(sample)
+                    s.sort(key=_canonical)
+                    del s[3:]
+
+    def loss_list(self):
+        return sorted(self.losses.values(), key=lambda l: (l["line"], l["col"], l["node"], _canonical(l["origin"])))
+
+    def loss_count(self):
+        return sum(l["count"] for l in self.losses.values())
 
     def fail(self, s: Stop):
         with self.lock:
@@ -195,8 +265,8 @@ class _Run:
 
 
 class Runtime:
-    def __init__(self, catalog, calls: AwsCalls, limits: Optional[Limits] = None):
-        self.catalog, self.calls, self.limits = catalog, calls, limits or Limits()
+    def __init__(self, catalog, calls: AwsCalls, limits: Optional[Limits] = None, allow_losses: bool = False, strict: bool = False):
+        self.catalog, self.calls, self.limits, self.allow_losses, self.strict = catalog, calls, limits or Limits(), allow_losses, strict
 
     # ── entry ────────────────────────────────────────────────────────────────
 
@@ -209,10 +279,10 @@ class Runtime:
             return {
                 "status": "error",
                 "error": {"class": "input", "code": "Input", "message": "; ".join(problems), "action": "rewrite"},
-                "completed": {}, "fanout": [], "mutations": [],
+                "completed": {}, "fanout": [], "mutations": [], "losses": [],
                 "accounting": {"calls": 0, "waves": 0, "wall_ms": 0},
             }
-        run = _Run(checked, given, self.limits)
+        run = _Run(checked, given, self.limits, self.allow_losses, self.strict)
         started = time.monotonic()
         value, exc = None, None
         try:
@@ -228,12 +298,17 @@ class Runtime:
             time.sleep(0.02)
         ms = int((time.monotonic() - started) * 1000)
         stop = run.primary()
+        if stop is None and exc is None and is_absent(value):
+            stop = Stop("data", "AbsentResult",
+                        f"the program's result is absent: {describe_origin(value.origin)}; a result is a value — return a record "
+                        "(e.g. { policy: ... }) to report an absence as a null field, or test it with .present()",
+                        None, checked.program.result.pos)
         if stop is None and exc is None:
             value = _normalize_order(value)
             run.result_bytes = len(_canonical(value).encode("utf-8"))
             if run.result_bytes > self.limits.max_result_bytes:
                 stop = Stop("budget", "MaxResultBytes",
-                            f"the result is {run.result_bytes} bytes, over the limit of {self.limits.max_result_bytes}; project fewer fields or narrow the list before returning",
+                            f"the result is {run.result_bytes} bytes, over the limit of {self.limits.max_result_bytes}; return fewer fields or narrow the list before returning",
                             None, checked.program.result.pos)
         if stop is None and exc is None:
             return self._success(run, value, ms)
@@ -309,9 +384,22 @@ class Runtime:
         if isinstance(e, Implicit):
             return env.implicit
         if isinstance(e, RecordE):
-            return {k: self._eval(v, env, run) for k, v in e.fields}
+            out = {}
+            for k, v in e.fields:
+                x = self._eval(v, env, run)
+                if is_absent(x) and x.unknown and not env.args:
+                    return x  # an unknown field makes the record unknown: it never becomes a null that claims absence
+                out[k] = x  # an absent field stays absent (carry)
+            return out
         if isinstance(e, ListE):
-            return [self._eval(v, env, run) for v in e.items]
+            out = []
+            for v in e.items:
+                x = self._eval(v, env, run)
+                if is_absent(x) and not env.args:
+                    run.loss("list", v.pos, x, env.element, env.in_each)  # lists never hold absent values
+                    continue
+                out.append(x)
+            return out
         if isinstance(e, BlockE):
             inner = env
             for b in e.bindings:
@@ -319,10 +407,17 @@ class Runtime:
             return self._eval(e.result, inner, run)
         if isinstance(e, Member):
             t = self._eval(e.target, env, run)
-            if t is None:
-                return None
+            if is_absent(t):
+                return t
             v = t.get(e.name) if isinstance(t, dict) else None
-            return T.normalize(v, run.c.type_of(e))
+            if is_absent(v):
+                return v
+            mt = run.c.type_of(e)
+            if v is None:
+                if isinstance(mt, T.TList):
+                    return []  # a defaulted list member (TOWL §10)
+                return Absent({"kind": "member", "member": e.name, "line": e.pos.line, "col": e.pos.col})
+            return T.normalize(v, mt)
         if isinstance(e, OpCall):
             return self._call(e, env, run)
         if isinstance(e, MethodCall):
@@ -331,24 +426,31 @@ class Runtime:
 
     def _call(self, e: OpCall, env: _Env, run: _Run):
         op = run.c.ops[id(e)]
-        site = next(s for s in run.c.effects if s.call is e)
-        params = self._eval(e.params, env, run)
+        aenv = env.for_args()
+        params = self._eval(e.params, aenv, run)
         args = dict(params) if isinstance(params, dict) else {}
         options = {}
         if isinstance(e.options, RecordE):
             for k, v in e.options.fields:
                 if k in ("region", "profile"):
-                    options[k] = self._eval(v, env, run)
-        if op.input is not None:
-            required = getattr(op, "required", None)
-            for k, t in op.input.fields.items():
-                needed = k in required if required is not None else (not T.is_nullable(t) and not isinstance(t, T.TList))
-                if needed and k in args and args[k] is None:
-                    run.fail(Stop("data", "NullParameter", f"parameter '{k}' of {op.id} was Null at runtime", op, e.pos, env.element, env.in_each))
-                if k in args and args[k] is not None:
-                    bad = T.null_at_required(args[k], t, k)
-                    if bad:
-                        run.fail(Stop("data", "NullParameter", f"parameter '{bad}' of {op.id} was Null at runtime", op, e.pos, env.element, env.in_each))
+                    options[k] = self._eval(v, aenv, run)
+        # an absent value never reaches an operation (TOWL §6.1): stop, naming the parameter and the origin
+        for where, value in (("parameter", args), ("option", options)):
+            found = _find_absent(value)
+            if found:
+                path, absent = found
+                o = absent.origin
+                hint = f"; to call only where it exists, filter first: .where(.{o['member']}.present())" if o.get("kind") == "member" else ""
+                run.fail(Stop("data", "AbsentArgument",
+                              f"{where} '{path}' of {op.id} is absent at runtime: {describe_origin(o)}; an absent value is never passed to an operation{hint}",
+                              op, e.pos, env.element, env.in_each))
+        mutate = op.effect != "read"
+        if mutate and run.losses and not run.allow_losses:
+            n = run.loss_count()
+            run.fail(Stop("losses", "LossesBeforeMutation",
+                          f"{op.id} was not dispatched: {n} element(s) were lost to absent values before it (see 'losses'); a mutation acts only on "
+                          "complete data. Handle the absence in the program (.present()/.absent() filters) or rerun with --allow-losses once the user accepts the losses",
+                          op, e.pos, env.element, env.in_each))
         if run.stopped.is_set():
             raise Stop("cancelled", "Stopped", f"stopped before {op.id} was dispatched", op, e.pos)
         if time.monotonic() - run.started > self.limits.wall_seconds:
@@ -360,7 +462,6 @@ class Runtime:
             run.fail(Stop("budget", "MaxCalls", f"call budget of {self.limits.max_calls} exceeded at {op.id}", op, e.pos))
         eff = run.effects.setdefault(f"{op.id}@{e.pos.line}", {"line": e.pos.line, "operation": op.id, "effect": op.effect})
         run.bump(eff, "calls")
-        mutate = op.effect != "read"
         run.calls.acquire()
         if mutate:
             run.mutation_lock.acquire()
@@ -371,15 +472,22 @@ class Runtime:
                 with run.lock:
                     run.in_flight_mutations += 1
             try:
-                raw = self.calls.invoke(op, {k: v for k, v in args.items() if v is not None}, options)
+                raw = self.calls.invoke(op, _plain(args), _plain(options))
             except Stop as s:  # adapter-raised budget stops are run failures too
+                if s.cls == "budget" and s.code == "MaxItems" and not mutate and env.in_each and not run.strict:
+                    # a per-call budget inside a fan-out element drops that element as a loss (TOWL §12.3)
+                    return Absent({"kind": "budget", "operation": op.id, "limit": "max-items",
+                                   "value": getattr(self.calls, "max_items", None), "line": e.pos.line}, unknown=True)
                 run.fail(Stop(s.cls, s.code, str(s), op, e.pos, env.element, env.in_each, s.aws))
         except OperationError as x:
-            if x.code in site.tolerate:
-                with run.lock:
-                    run.tolerated.append({"line": e.pos.line, "operation": op.id, "code": x.code, "element": env.element})
-                return None
             cls = x.aws.get("class") if x.aws.get("class") == "configuration" else ("mutation" if mutate else classify_error(x.code))
+            # a failed read is absorbed by class (TOWL §12.4): absence -> absent; authorization/availability -> unknown,
+            # which needs an enclosing list element to drop; everything else, a mutation, or --strict stops
+            absorb = not run.strict and (cls == "absence" or (cls in ("authorization", "availability") and env.in_each))
+            if absorb:
+                with run.lock:
+                    run.absorbed.append({"line": e.pos.line, "operation": op.id, "code": x.code, "class": cls, "element": _plain(env.element)})
+                return Absent({"kind": "error", "operation": op.id, "code": x.code, "class": cls, "line": e.pos.line}, unknown=cls != "absence")
             run.fail(Stop(cls, x.code, str(x), op, e.pos, env.element, env.in_each, x.aws))
         except Stop:
             raise
@@ -393,19 +501,27 @@ class Runtime:
             run.calls.release()
         if mutate:
             with run.lock:
-                run.mutations.append({"line": e.pos.line, "operation": op.id, "element": env.element, "params": args,
-                                      "options": {"tolerate": list(site.tolerate), **options}, "response": raw})
+                run.mutations.append({"line": e.pos.line, "operation": op.id, "element": _plain(env.element), "params": _plain(args),
+                                      "options": _plain(options), "response": raw})
         return T.normalize(raw, op.output)
 
     def _method(self, e: MethodCall, env: _Env, run: _Run):
         target = self._eval(e.target, env, run)
         name = e.name
+        if name in ("present", "absent"):
+            if is_absent(target) and target.unknown:
+                return target  # a read that could not be done does not say whether the value exists
+            return is_absent(target) == (name == "absent")
+        if is_absent(target):
+            return target  # carry: a function of an absent value is absent (TOWL §9.2)
         if name == "for":
             return self._for(e, target, env, run)
-        if name in STR_FNS:
-            return _string_fn(name, target, [self._eval(a.expr, env, run) for a in e.args if isinstance(a, ExprArg)])
-        if name in TIME_FNS:
-            return _time_fn(name, target, [self._eval(a.expr, env, run) for a in e.args if isinstance(a, ExprArg)])
+        if name in STR_FNS or name in TIME_FNS:
+            args = [self._eval(a.expr, env, run) for a in e.args if isinstance(a, ExprArg)]
+            bad = next((a for a in args if is_absent(a)), None)
+            if bad is not None:
+                return bad
+            return (_string_fn if name in STR_FNS else _time_fn)(name, target, args)
         lst = target if isinstance(target, list) else []
         n = run.node(name, e.pos)
         run.bump(n, "in", len(lst))
@@ -415,69 +531,85 @@ class Runtime:
                 return el  # identity path: a list of scalars
             return self._eval(e.args[i].expr, env.with_element(el), run)
 
+        def keyed(i=0):
+            """(value, element) for every element whose path is present; the others are skipped and recorded."""
+            out = []
+            for el in lst:
+                v = path_of(el, i)
+                if is_absent(v):
+                    run.loss(name, e.pos, v, el, True)
+                else:
+                    out.append((v, el))
+            return out
+
         def pred(el, i=0):
             return self._pred(e.args[i].pred, env.with_element(el), run)
 
-        if name == "project":
-            out = [path_of(el) for el in lst]
-        elif name == "flat":
-            out = [x for el in lst for x in (path_of(el) if isinstance(path_of(el), list) else [])]
+        def empty(fn):
+            return Absent({"kind": "empty", "function": fn, "line": e.pos.line})
+
+        if name == "flat":
+            out = [x for v, _ in keyed() for x in (v if isinstance(v, list) else [])]
         elif name == "flatten":
             out = [x for el in lst for x in (el if isinstance(el, list) else [])]
         elif name == "where":
-            out = [el for el in lst if pred(el)]
-        elif name == "compact":
-            out = [el for el in lst if el is not None]
+            out = []
+            for el in lst:
+                r = pred(el)
+                if r is True:
+                    out.append(el)
+                elif is_absent(r):
+                    run.loss("where", e.pos, r, el, True, reason="undecided")
         elif name == "distinct":
             seen, out = set(), []
-            for el in lst:
-                k = _canonical(path_of(el) if e.args else el)
+            for v, _ in (keyed() if e.args else [(el, el) for el in lst]):
+                k = _canonical(v)
                 if k not in seen:
                     seen.add(k)
-                    out.append(path_of(el) if e.args else el)
+                    out.append(v)
         elif name == "concat":
             other = self._eval(e.args[0].expr, env, run)
+            if is_absent(other):
+                return other
             out = lst + (other if isinstance(other, list) else [])
         elif name == "group":
             groups: Dict[str, dict] = {}
-            for el in lst:
-                k = path_of(el)
+            for k, el in keyed():
                 groups.setdefault(_canonical(k), {"key": k, "items": []})["items"].append(el)
             out = list(groups.values())
         elif name == "single":
             if len(lst) > 1:
                 run.fail(Stop("cardinality", "NotSingle", f"single() found {len(lst)} elements", None, e.pos, env.element, env.in_each))
-            out = lst[0] if lst else None
+            out = lst[0] if lst else empty("single")
         elif name == "count":
             out = len(lst)
         elif name == "sum":
-            vals = [v for v in (path_of(el) for el in lst) if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            vals = [v for v, _ in keyed() if isinstance(v, (int, float)) and not isinstance(v, bool)]
             out = sum(vals) if vals else 0
         elif name in ("min", "max"):
-            vals = [v for v in (path_of(el) for el in lst) if v is not None]
-            out = (min if name == "min" else max)(vals, key=_ord_key) if vals else None
+            vals = [v for v, _ in keyed()]
+            out = (min if name == "min" else max)(vals, key=_ord_key) if vals else empty(name)
         elif name == "avg":
-            vals = [v for v in (path_of(el) for el in lst) if isinstance(v, (int, float)) and not isinstance(v, bool)]
-            out = (sum(vals) / len(vals)) if vals else None
+            vals = [v for v, _ in keyed() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            out = (sum(vals) / len(vals)) if vals else empty("avg")
         elif name == "collect":
-            out = [v for v in (path_of(el) for el in lst) if v is not None]
+            out = [v for v, _ in keyed()]
         elif name in ("top", "bottom"):
             count = self._eval(e.args[0].expr, env, run)
+            if is_absent(count):
+                return count
             count = count if isinstance(count, int) and not isinstance(count, bool) else 0
-            keyed = [(path_of(el, 1) if len(e.args) > 1 else el, el) for el in lst]
-            keyed = [(k, el) for k, el in keyed if k is not None]
+            ks = keyed(1) if len(e.args) > 1 else [(el, el) for el in lst]
             order = _neg_key if name == "top" else _ord_key
-            keyed.sort(key=lambda kv: (order(kv[0]), _canonical(kv[1])))  # ties broken by canonical element order
-            out = [{"rank": i + 1, "value": el} for i, (k, el) in enumerate(keyed[:count])]
-        elif name == "any":
-            out = any(pred(el) for el in lst)
-        elif name == "all":
-            out = all(pred(el) for el in lst)
+            ks.sort(key=lambda kv: (order(kv[0]), _canonical(kv[1])))  # ties broken by canonical element order
+            out = [{"rank": i + 1, "value": el} for i, (k, el) in enumerate(ks[:count])]
+        elif name in ("any", "all"):
+            out = _fold(name == "all", (pred(el) for el in lst))
         else:
             run.fail(Stop("other", "Internal", f"unknown function {name}", None, e.pos))
         if isinstance(out, list):
             run.bump(n, "out", len(out))
-        elif out is not None:
+        elif out is not None and not is_absent(out):
             n["out"] = out if isinstance(out, (bool, int, float)) else 1
         return out
 
@@ -486,8 +618,20 @@ class Runtime:
         items = target if isinstance(target, list) else []
         n = run.node("for", e.pos)
         run.bump(n, "in", len(items))
+
+        def keep(i, v):
+            """A body whose result is absent drops its element (TOWL §7, §9.2)."""
+            if is_absent(v):
+                run.loss("for", e.pos, v, items[i], True)
+                return False
+            return True
+
         if id(e) not in run.c.waves:
-            out = [self._eval(lam.body, env.for_element(lam.param, it), run) for it in items]
+            out = []
+            for i, it in enumerate(items):
+                v = self._eval(lam.body, env.for_element(lam.param, it), run)
+                if keep(i, v):
+                    out.append(v)
             run.bump(n, "out", len(out))
             return out
         if len(items) > self.limits.max_width:
@@ -521,57 +665,87 @@ class Runtime:
         if any(f is not None for f in failures):
             run.fanouts[str(e.pos)] = {
                 "line": e.pos.line,
-                "completed": [{"element": items[i], "value": results[i]} for i in range(len(items)) if done[i]],
-                "failed": [{"element": items[i], "code": failures[i].code, "message": str(failures[i])} for i in own],
-                "interrupted": [items[i] for i in range(len(items)) if started[i] and not done[i] and i not in own],
-                "not_started": [items[i] for i in range(len(items)) if not started[i]],
+                "completed": [{"element": _plain(items[i]), "value": _plain(results[i])} for i in range(len(items)) if done[i] and not is_absent(results[i])],
+                "failed": [{"element": _plain(items[i]), "code": failures[i].code, "message": str(failures[i])} for i in own],
+                "interrupted": [_plain(items[i]) for i in range(len(items)) if started[i] and not done[i] and i not in own],
+                "not_started": [_plain(items[i]) for i in range(len(items)) if not started[i]],
             }
+            for i in range(len(items)):
+                if done[i]:
+                    keep(i, results[i])
             first = own[0] if own else next(i for i, f in enumerate(failures) if f is not None)
             raise failures[first]
         if run.stopped.is_set():
             raise Stop("cancelled", "Stopped", "stopped during wave", None, e.pos)
-        run.bump(n, "out", len(items))
-        return results
+        unknown = [i for i in range(len(items)) if is_absent(results[i]) and results[i].unknown and results[i].origin.get("kind") in ("error", "budget")]
+        if items and len(unknown) == len(items):
+            # every element failed to be read: the program or its credentials are wrong, not the data (TOWL §12.4)
+            first = min(unknown, key=lambda i: _canonical(items[i]))
+            o = results[first].origin
+            cls, code = (o["class"], o["code"]) if o["kind"] == "error" else ("budget", "MaxItems")
+            run.fanouts[str(e.pos)] = {"line": e.pos.line, "completed": [], "interrupted": [], "not_started": [],
+                                       "failed": [{"element": _plain(items[i]), "code": code if results[i].origin["kind"] != "error" else results[i].origin["code"],
+                                                   "message": describe_origin(results[i].origin)} for i in unknown]}
+            run.fail(Stop(cls, code,
+                          f"every one of the {len(items)} elements of this for failed to be read (first: {describe_origin(o)}); a failure that affects everything "
+                          "stops instead of returning an empty result: check permissions, regions, or limits, or narrow the source list",
+                          next((x for x in run.c.ops.values() if x.id == o["operation"]), None), e.pos, items[first], True))
+        out = [results[i] for i in range(len(items)) if keep(i, results[i])]
+        run.bump(n, "out", len(out))
+        return out
 
-    # ── predicates ───────────────────────────────────────────────────────────
+    # ── predicates: three-valued (TOWL §8.3); an Absent result means undecided and carries the origin ──
 
-    def _pred(self, pr, env: _Env, run: _Run) -> bool:
+    def _pred(self, pr, env: _Env, run: _Run):
         if isinstance(pr, AndP):
-            return all(self._pred(t, env, run) for t in pr.terms)
+            return _fold(True, (self._pred(t, env, run) for t in pr.terms))
         if isinstance(pr, OrP):
-            return any(self._pred(t, env, run) for t in pr.terms)
+            return _fold(False, (self._pred(t, env, run) for t in pr.terms))
         if isinstance(pr, NotP):
-            return not self._pred(pr.term, env, run)
+            r = self._pred(pr.term, env, run)
+            return r if is_absent(r) else not r
         if isinstance(pr, Cmp):
             l, r = self._eval(pr.left, env, run), self._eval(pr.right, env, run)
+            if is_absent(l):
+                return l
+            if is_absent(r):
+                return r
             if pr.op == "==":
                 return _eq(l, r)
             if pr.op == "!=":
                 return not _eq(l, r)
-            if l is None or r is None:
-                return False
             c = (_ord_key(l) > _ord_key(r)) - (_ord_key(l) < _ord_key(r))
             return {"<": c < 0, "<=": c <= 0, ">": c > 0, ">=": c >= 0}[pr.op]
         if isinstance(pr, InP):
             l, r = self._eval(pr.left, env, run), self._eval(pr.right, env, run)
+            if is_absent(l):
+                return l
+            if is_absent(r):
+                return r
             return any(_eq(x, l) for x in (r if isinstance(r, list) else []))
         if isinstance(pr, TestP):
             v = self._eval(pr.operand, env, run)
+            if is_absent(v) and v.unknown:
+                return v
             if pr.fn == "present":
-                return v is not None
+                return not is_absent(v)
             if pr.fn == "absent":
-                return v is None
+                return is_absent(v)
+            if is_absent(v):
+                return v
             if pr.fn == "empty":
                 return not v
             a = self._eval(pr.arg, env, run) if pr.arg is not None else ""
+            if is_absent(a):
+                return a
             if not isinstance(v, str) or not isinstance(a, str):
                 return False
             return {"contains": a in v, "starts_with": v.startswith(a), "ends_with": v.endswith(a)}[pr.fn]
         if isinstance(pr, QuantP):
             l = self._eval(pr.operand, env, run)
-            l = l if isinstance(l, list) else []
-            q = all if pr.all else any
-            return q(self._pred(pr.inner, env.with_element(x), run) for x in l)
+            if is_absent(l):
+                return l
+            return _fold(pr.all, (self._pred(pr.inner, env.with_element(x), run) for x in (l if isinstance(l, list) else [])))
         return False
 
     # ── envelopes ────────────────────────────────────────────────────────────
@@ -581,11 +755,12 @@ class Runtime:
             "status": "ok",
             "type": str(run.c.result_type),
             "value": value,
-            "tolerated": sorted(run.tolerated, key=lambda t: t["line"]),
+            "losses": run.loss_list(),
+            "absorbed": sorted(run.absorbed, key=lambda t: (t["line"], _canonical(t))),
             "effects": sorted(run.effects.values(), key=lambda x: x["line"]),
             "nodes": sorted(run.nodes.values(), key=lambda x: x["line"]),
             "accounting": {"calls": run.call_count, "waves": run.waves, "wall_ms": ms, "result_bytes": run.result_bytes,
-                           "tolerated": len(run.tolerated)},
+                           "absorbed": len(run.absorbed), "losses": run.loss_count()},
         }
 
     def _failure(self, run: _Run, s: Stop, ms):
@@ -593,24 +768,76 @@ class Runtime:
             "status": "error",
             "error": {
                 "class": s.cls, "code": s.code, "message": str(s), "operation": s.op.id if s.op else None,
-                "line": s.pos.line if s.pos else None, "element": s.element if s.has_element else None,
+                "line": s.pos.line if s.pos else None, "element": _plain(s.element) if s.has_element else None,
                 "action": _action(s.cls), "aws": s.aws or None,
             },
             "errors_also": [
                 {"class": f.cls, "code": f.code, "message": str(f), "operation": f.op.id if f.op else None,
-                 "line": f.pos.line if f.pos else None, "element": f.element if f.has_element else None}
+                 "line": f.pos.line if f.pos else None, "element": _plain(f.element) if f.has_element else None}
                 for f in run.failures if f is not s and f.cls != "cancelled"
             ],
             "completed": {k: {"type": str(run.c.binding_types.get(k)), "value": _normalize_order(v)} for k, v in sorted(run.completed.items())},
+            "losses": run.loss_list(),
             "fanout": sorted(run.fanouts.values(), key=lambda x: x["line"]),
             "mutations": list(run.mutations),
-            "accounting": {"calls": run.call_count, "waves": run.waves, "wall_ms": ms},
+            "accounting": {"calls": run.call_count, "waves": run.waves, "wall_ms": ms, "losses": run.loss_count()},
         }
 
 
 def _action(cls):
-    return {"transient": "rerun", "cancelled": "rerun", "authorization": "tolerate-candidate", "availability": "tolerate-candidate",
-            "absence": "tolerate-candidate", "budget": "budget", "mutation": "mutation", "configuration": "configure"}.get(cls, "rewrite")
+    return {"transient": "rerun", "cancelled": "rerun", "authorization": "narrow", "availability": "narrow",
+            "absence": "narrow", "budget": "budget", "mutation": "mutation", "configuration": "configure",
+            "losses": "losses"}.get(cls, "rewrite")
+
+
+def _fold(conj: bool, results):
+    """Kleene and (conj) / or over True, False, and Absent (undecided): the deciding value wins, else the first
+    undecided, else the identity."""
+    undecided = None
+    for r in results:
+        if is_absent(r):
+            undecided = undecided or r
+        elif bool(r) != conj:
+            return not conj
+    return undecided if undecided is not None else conj
+
+
+def _find_absent(v, path=""):
+    """First (path, Absent) inside a call's args/options structure."""
+    if is_absent(v):
+        return (path or "<value>", v)
+    if isinstance(v, dict):
+        for k, x in v.items():
+            got = _find_absent(x, f"{path}.{k}" if path else k)
+            if got:
+                return got
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            got = _find_absent(x, f"{path}[{i}]")
+            if got:
+                return got
+    return None
+
+
+def _plain(v):
+    """JSON value: absent record fields become null (TOWL §12.5)."""
+    if is_absent(v):
+        return None
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_plain(x) for x in v]
+    return v
+
+
+def _abbrev(el):
+    """A loss sample: records are shortened to their scalar members."""
+    el = _plain(el)
+    if isinstance(el, dict):
+        return {k: v for k, v in el.items() if isinstance(v, (str, int, float, bool))}
+    if isinstance(el, list):
+        return f"<list of {len(el)}>"
+    return el
 
 
 def _has_mutation(expr, checked) -> bool:
@@ -731,11 +958,13 @@ def _ord_key(v):
 
 
 def _canonical(v) -> str:
-    return json.dumps(v, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(v, sort_keys=True, separators=(",", ":"), default=lambda o: None if is_absent(o) else str(o))
 
 
 def _normalize_order(v):
-    """Lists are bags: serialize elements in canonical order (TOWL §12.5)."""
+    """Lists are bags: serialize elements in canonical order (TOWL §12.5); absent fields become null."""
+    if is_absent(v):
+        return None
     if isinstance(v, dict):
         return {k: _normalize_order(x) for k, x in v.items()}
     if isinstance(v, list):

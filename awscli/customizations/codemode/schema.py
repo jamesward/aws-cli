@@ -266,7 +266,8 @@ class SchemaService:
 
     def signature(self, op, depth=2, summary=False, match=None):
         """TOWL v3 view of one operation: exact id, parameter and (merged) result types, effect, paging, codes."""
-        out = T.strip_null(op.output)
+        out = op.output
+        list_members = [k for k, v in out.fields.items() if isinstance(v, T.TList)] if isinstance(out, T.TRecord) else []
         base = {
             "operation": op.id,
             "cli": f"{op.service}:{op.operation}",
@@ -277,7 +278,7 @@ class SchemaService:
             "paged": op.paged,
             "note": (
                 "the call's value IS the result (a bare value); there is no wrapper member" if T.is_scalar(out) or out is T.JSON
-                else f"access members of the returned record, e.g. .{next(iter(out.fields), '')}" if isinstance(out, T.TRecord) and out.fields
+                else f"access members of the returned record, e.g. .{(list_members or list(out.fields))[0]}" if isinstance(out, T.TRecord) and out.fields
                 else None
             ),
         }
@@ -296,8 +297,7 @@ class SchemaService:
 
 
 def returns_text(t):
-    base = T.strip_null(t)
-    if T.is_scalar(base) or base is T.JSON:
+    if T.is_scalar(t) or t is T.JSON:
         return f"{t}  (a bare value, not a record)"
     return T.describe(t, 1)
 
@@ -309,9 +309,7 @@ def named_shapes(roots, depth=3):
     def walk(t, d):
         if d < 0:
             return
-        if isinstance(t, T.TNullable):
-            walk(t.inner, d)
-        elif isinstance(t, T.TList):
+        if isinstance(t, T.TList):
             walk(t.element, d)
         elif isinstance(t, T.TRecord):
             if t.name and t.name in out:
@@ -330,15 +328,17 @@ def named_shapes(roots, depth=3):
 def type_schema(t, depth=3, _seen=None):
     """Expanded TOWL type as JSON, bounded by depth; named shapes beyond the depth are referenced by name."""
     seen = set() if _seen is None else _seen
-    if isinstance(t, T.TNullable):
-        return {"type": type_schema(t.inner, depth, seen), "nullable": True}
     if isinstance(t, T.TList):
         return {"list": type_schema(t.element, depth, seen)}
     if isinstance(t, T.TRecord):
         if (t.name and t.name in seen) or depth <= 0:
             return {"shape": t.name or "{...}"}
         inner = seen | ({t.name} if t.name else set())
-        return {("shape" if t.name else "record"): t.name, "fields": {k: type_schema(v, depth - 1, inner) for k, v in t.fields.items()}} if t.name else {"fields": {k: type_schema(v, depth - 1, inner) for k, v in t.fields.items()}}
+        out = {"shape": t.name} if t.name else {}
+        out["fields"] = {k: type_schema(v, depth - 1, inner) for k, v in t.fields.items()}
+        if t.optional:
+            out["optional"] = sorted(t.optional)  # may be absent at runtime; informational (TOWL §4)
+        return out
     return str(t)
 
 
@@ -376,8 +376,10 @@ def render_schema_text(response):
             lines.append(f"  params:  {m['params']}")
             if "required" in m and m["params"] != "{}":
                 req = ", ".join(m["required"]) if m["required"] else "none"
-                lines.append(f"  required: {req}   (omit the others unless needed; never pass [] or null)")
+                lines.append(f"  required: {req}   (omit the others unless needed; never pass [])")
             lines.append(f"  returns: {m['returns']}")
+            if "?:" in m["returns"] or any("?:" in f for f in m.get("shapes", {}).values()):
+                lines.append("  (Name?: T = the provider may leave the member out; an element that needs it is dropped and reported in 'losses')")
             if m.get("note"):
                 lines.append(f"  note:    {m['note']}")
             if m.get("errorCodes"):

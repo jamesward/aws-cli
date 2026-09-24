@@ -12,6 +12,10 @@
       ],
       "forbid_substrings": [
         ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
         "=>",
         "MaxResults",
         "NextToken",
@@ -36,12 +40,20 @@
       ],
       "forbid_substrings": [
         ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
         "=>",
         "ExtendedStatistics: []",
         "map@"
       ],
       "forbid_warnings": [
-        "null.tolerateDefaulted"
+        "syntax.nullSafe",
+        "syntax.nullCompare",
+        "syntax.nullType",
+        "syntax.compact",
+        "syntax.tolerate"
       ],
       "max_codemode_calls": 10
     },
@@ -59,6 +71,10 @@
       ],
       "forbid_substrings": [
         ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
         "=>",
         "codemode run",
         "map@"
@@ -80,6 +96,10 @@
       ],
       "forbid_substrings": [
         ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
         "=>",
         "codemode run",
         "map@"
@@ -102,6 +122,10 @@
       ],
       "forbid_substrings": [
         ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
         "=>",
         "codemode run",
         "map@"
@@ -121,6 +145,10 @@
       ],
       "forbid_substrings": [
         ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
         "=>",
         "codemode run",
         "map@"
@@ -140,6 +168,10 @@
       ],
       "forbid_substrings": [
         ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
         "=>",
         "ContinuationToken",
         "MaxKeys",
@@ -161,11 +193,47 @@
       ],
       "forbid_substrings": [
         ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
         "=>",
         "codemode run",
         "map@"
       ],
       "max_codemode_calls": 8
+    },
+    {
+      "id": "top10-objects",
+      "prompt": "List my top 10 largest S3 objects across all buckets, with bucket name, key and size.",
+      "expect_ops_all": [
+        "s3.ListBuckets",
+        "s3.ListObjectsV2"
+      ],
+      "expect_substrings": [
+        "top(10",
+        "for "
+      ],
+      "forbid_substrings": [
+        ".or(",
+        "tolerate",
+        "| Null",
+        ".compact()",
+        "?.",
+        "=>",
+        "ContinuationToken",
+        "MaxKeys",
+        "codemode run",
+        "map@"
+      ],
+      "forbid_warnings": [
+        "syntax.nullSafe",
+        "syntax.nullCompare",
+        "syntax.nullType",
+        "syntax.compact",
+        "syntax.tolerate"
+      ],
+      "max_codemode_calls": 6
     }
   ]
 }
